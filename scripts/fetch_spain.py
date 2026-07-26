@@ -28,7 +28,6 @@ from common import (  # noqa: E402
 # "PreciosCarburantes/EstacionesTerrestres/"
 SOURCE_URL = (
     "SPAIN_SOURCE_URL"
-    "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/"
 )
 STATE_PATH = "state/es_last_fetch.json"
 DATA_DIR = "data/es"
