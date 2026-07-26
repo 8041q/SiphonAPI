@@ -1,0 +1,40 @@
+name: Keepalive
+
+# GitHub automatically disables scheduled workflows after 60 days with no repository activity
+# This runs monthly and only makes a spam commit if there hasn't been a real commit in the last 45 days
+
+on:
+  schedule:
+    - cron: "14 3 1 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check days since last commit
+        id: check
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          days=$(( (now - last) / 86400 ))
+          echo "days=$days" >> "$GITHUB_OUTPUT"
+          echo "Last commit was $days day(s) ago."
+
+      - name: Commit heartbeat if stale
+        if: steps.check.outputs.days > 45
+        run: |
+          git config user.name "fuel-prices-bot"
+          git config user.email "actions@users.noreply.github.com"
+          mkdir -p state
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > state/heartbeat.txt
+          git add state/heartbeat.txt
+          git commit -m "Keepalive: no data changes in ${{ steps.check.outputs.days }} days [skip ci]"
+          git push

@@ -1,0 +1,50 @@
+name: Update fuel price data
+
+# Runs hourly. 
+# Spain's fetch exits almost immediately when nothing has changed since it checks a single timestamp field first,
+# so the hourly schedule costs almost nothing on the days Spain hasn't refreshed.
+# Portugal's fetch does a full per-fuel fetch each run (DGEG has no equivalent
+# single flag), but only writes files for stations that actually changed.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch Spain
+        run: python scripts/fetch_spain.py
+
+      - name: Fetch Portugal
+        run: python scripts/fetch_portugal.py
+
+      - name: Commit changes if any
+        run: |
+          git config user.name "fuel-prices-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data state
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update fuel price data [skip ci]"
+            git push
+          fi
