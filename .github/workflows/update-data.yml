@@ -35,6 +35,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Debug secret presence
+        env:
+          SPAIN_SOURCE_URL: ${{ secrets.SPAIN_SOURCE_URL }}
+        run: |
+          if [ -z "$SPAIN_SOURCE_URL" ]; then
+            echo "SPAIN_SOURCE_URL is EMPTY"
+          else
+            echo "SPAIN_SOURCE_URL length: ${#SPAIN_SOURCE_URL}"
+          fi
+
       - name: Fetch Spain
         env:
           SPAIN_SOURCE_URL: ${{ secrets.SPAIN_SOURCE_URL }}
