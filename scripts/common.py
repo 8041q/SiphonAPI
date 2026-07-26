@@ -3,6 +3,7 @@
 # - HTTP session that always sends a proper identifiable User-Agent
 # - JSON read/write helpers that only touch a file on disk when its content has actually changed
 # - parsers for the odd number formats each source uses
+# - manifest helpers (content_hash / bbox_from_features)
 
 import hashlib
 import json
@@ -26,6 +27,13 @@ def make_session():
         }
     )
 
+    # Send secret key to Cloudflare Worker if configured
+    proxy_key = os.environ.get("SPAIN_PROXY_KEY")
+    if proxy_key:
+        headers["X-API-Key"] = proxy_key
+
+    session.headers.update(headers)
+    
     # Allow retries on protocol-level connection drops (like reset by peer)
     retry_strategy = Retry(
         total=4,
@@ -48,8 +56,9 @@ def fetch_json(session, url, timeout=60):
     return resp.json()
 
 
-def _hash(obj):
-    # Order-independent content hash, used to detect real changes
+def content_hash(obj):
+    # Order-independent content hash. Used to decide whether to write a file
+    # at all, AND embedded directly in the manifests
     return hashlib.sha256(
         json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -67,7 +76,7 @@ def write_json_if_changed(path, obj):
     # Returns True if the file has changes, otherwise it's False
 
     existing = load_json(path)
-    if existing is not None and _hash(existing) == _hash(obj):
+    if existing is not None and content_hash(existing) == content_hash(obj):
         return False
 
     dirname = os.path.dirname(path)
@@ -76,6 +85,13 @@ def write_json_if_changed(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
     return True
+
+
+def bbox_from_features(features):
+    # [minLng, minLat, maxLng, maxLat] for a list of GeoJSON Point features.
+    lngs = [f["geometry"]["coordinates"][0] for f in features]
+    lats = [f["geometry"]["coordinates"][1] for f in features]
+    return [min(lngs), min(lats), max(lngs), max(lats)]
 
 
 def parse_es_number(value):

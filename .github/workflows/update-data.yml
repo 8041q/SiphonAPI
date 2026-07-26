@@ -5,6 +5,10 @@ name: Update fuel price data
 # so the hourly schedule costs almost nothing on the days Spain hasn't refreshed.
 # Portugal's fetch does a full per-fuel fetch each run (DGEG has no equivalent
 # single flag), but only writes files for stations that actually changed.
+#
+# build_manifest.py combines both countries' manifests into one small root
+# manifest.json so that there is only a single file a client polls to know whether anything
+# changed anywhere.
 
 on:
   schedule:
@@ -31,17 +35,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Run fetch_spain script
+        env:
+          SPAIN_SOURCE_URL: ${{ secrets.SPAIN_SOURCE_URL }}
+          SPAIN_PROXY_KEY: ${{ secrets.SPAIN_PROXY_KEY }}
+        run: python scripts/fetch_spain.py
+        
       - name: Fetch Spain
         run: python scripts/fetch_spain.py
 
       - name: Fetch Portugal
         run: python scripts/fetch_portugal.py
 
+      - name: Build root manifest
+        run: python scripts/build_manifest.py
+
       - name: Commit changes if any
         run: |
           git config user.name "fuel-prices-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data state
+          git add data state manifest.json
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else

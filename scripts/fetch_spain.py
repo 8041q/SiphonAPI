@@ -6,12 +6,16 @@
 # Output: one GeoJSON file per 1x1 degree grid tile under data/es/, plus a manifest.json listing the tiles
 # Grid partitioning exists purely so a client only has to download the tiles near it, instead of a country on every launch
 
+# manifest.json also carries a content hash + bbox + station count per tile
+
 import math
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
+    bbox_from_features,
+    content_hash,
     fetch_json,
     load_json,
     make_session,
@@ -19,9 +23,12 @@ from common import (  # noqa: E402
     write_json_if_changed,
 )
 
+# Original API source. Now I use a proxy in cloudfare to bypass Spain block
+# "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/"
+# "PreciosCarburantes/EstacionesTerrestres/"
 SOURCE_URL = (
-    "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/"
-    "PreciosCarburantes/EstacionesTerrestres/"
+    "SPAIN_SOURCE_URL",
+    "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/"
 )
 STATE_PATH = "state/es_last_fetch.json"
 DATA_DIR = "data/es"
@@ -126,18 +133,28 @@ def run():
         tiles.setdefault(grid_key(lat, lng), []).append(feature)
 
     changed_tiles = 0
+    tile_entries = {}
     for key, features in tiles.items():
         features.sort(key=lambda f: f["properties"]["id"])  # deterministic diffs
         geojson = {"type": "FeatureCollection", "features": features}
         path = os.path.join(DATA_DIR, f"{key}.geojson")
         if write_json_if_changed(path, geojson):
             changed_tiles += 1
+        tile_entries[key] = {
+            "path": path.replace(os.sep, "/"),
+            "stationCount": len(features),
+            "bbox": bbox_from_features(features),
+            "hash": content_hash(geojson),
+        }
 
     manifest = {
         "lastUpdated": current_fecha,
         "tileCount": len(tiles),
-        "tiles": sorted(tiles.keys()),
+        # looks the entry up directly and compares "hash" to what it cached
+        # last time instead of downloading every tile to check
+        "tiles": tile_entries,
     }
+
     write_json_if_changed(os.path.join(DATA_DIR, "manifest.json"), manifest)
     write_json_if_changed(STATE_PATH, {"fecha": current_fecha})
 

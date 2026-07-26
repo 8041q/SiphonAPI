@@ -7,6 +7,8 @@
 
 # Output: one GeoJSON file per district under data/pt/, plus a manifest.json.
 
+# manifest.json also carries a content hash + bbox + station count per
+# district, plus generatedAt / dataUpdatedThrough freshness fields
 
 import os
 import sys
@@ -15,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
+    bbox_from_features,
+    content_hash,
     fetch_json,
     load_json,
     make_session,
@@ -243,16 +247,30 @@ def run():
         by_district.setdefault(district, []).append(feature)
 
     changed_files = 0
+    district_entries = {}
+    data_updated_through = None
     for district, features in by_district.items():
         features.sort(key=lambda f: f["properties"]["id"])  # deterministic diffs
         geojson = {"type": "FeatureCollection", "features": features}
         path = os.path.join(DATA_DIR, f"district_{district}.geojson")
         if write_json_if_changed(path, geojson):
             changed_files += 1
+        district_entries[district] = {
+            "path": path.replace(os.sep, "/"),
+            "stationCount": len(features),
+            "bbox": bbox_from_features(features),
+            "hash": content_hash(geojson),
+        }
+        for feature in features:
+            updated = feature["properties"].get("lastUpdated")
+            if updated and (data_updated_through is None or updated > data_updated_through):
+                data_updated_through = updated
 
     manifest = {
-        "districts": sorted(by_district.keys()),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "dataUpdatedThrough": data_updated_through,
         "stationCount": len(stations),
+        "districts": district_entries,
     }
 
     write_json_if_changed(os.path.join(DATA_DIR, "manifest.json"), manifest)

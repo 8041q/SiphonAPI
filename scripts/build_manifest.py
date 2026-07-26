@@ -1,0 +1,62 @@
+# Builds the top-level manifest.json at the repo root.
+
+# fetch_spain.py and fetch_portugal.py each already maintain their own
+# manifest (data/es/manifest.json, data/pt/manifest.json) listing their
+# tiles/districts with a hash, bbox and station count apiece. This script
+# just combines those two into one tiny root file, so a client only ever
+# has to fetch ONE small thing to know whether anything changed anywhere,
+
+# Run this after both fetch scripts
+
+import os
+import sys
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(__file__))
+from common import content_hash, load_json, write_json_if_changed  # noqa: E402
+
+MANIFEST_PATH = "manifest.json"
+
+COUNTRY_MANIFESTS = {
+    "ES": "data/es/manifest.json",
+    "PT": "data/pt/manifest.json",
+}
+
+
+def run():
+    existing = load_json(MANIFEST_PATH, default={})
+    existing_countries = existing.get("countries", {})
+
+    countries = {}
+    for code, path in COUNTRY_MANIFESTS.items():
+        country_manifest = load_json(path)
+        if country_manifest is None:
+            # First run before that country has ever written anything, just skip it rather than fail; it'll appear once it exists.
+            continue
+        countries[code] = {
+            "manifest": path,
+            "hash": content_hash(country_manifest),
+            # Spain calls this lastUpdated, Portugal calls it dataUpdatedThrough - normalize to one field so a client doesn't need to know each country's field name
+            "lastUpdated": country_manifest.get("lastUpdated")
+            or country_manifest.get("dataUpdatedThrough"),
+        }
+
+    if countries == existing_countries:
+        print("Root manifest: no country manifest changed, skipping.")
+        return False
+
+    manifest = {
+        "version": 1,
+        # Only advances when a country's hash actually changed, not on every run 
+        # this stays a meaningful "last real change" signal instead of "last time the workflow happened to run"
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "countries": countries,
+    }
+
+    write_json_if_changed(MANIFEST_PATH, manifest)
+    print("Root manifest: updated ->", ", ".join(sorted(countries)))
+    return True
+
+
+if __name__ == "__main__":
+    run()
