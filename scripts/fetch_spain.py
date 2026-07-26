@@ -26,9 +26,7 @@ from common import (  # noqa: E402
 # Original API source. Now I use a proxy in cloudfare to bypass Spain block
 # "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/"
 # "PreciosCarburantes/EstacionesTerrestres/"
-SOURCE_URL = (
-    "SPAIN_SOURCE_URL"
-)
+SOURCE_URL = os.environ.get("SPAIN_SOURCE_URL")
 STATE_PATH = "state/es_last_fetch.json"
 DATA_DIR = "data/es"
 

@@ -35,15 +35,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run fetch_spain script
+      - name: Fetch Spain
         env:
           SPAIN_SOURCE_URL: ${{ secrets.SPAIN_SOURCE_URL }}
           SPAIN_PROXY_KEY: ${{ secrets.SPAIN_PROXY_KEY }}
         run: python scripts/fetch_spain.py
         
-      - name: Fetch Spain
-        run: python scripts/fetch_spain.py
-
       - name: Fetch Portugal
         run: python scripts/fetch_portugal.py
 
