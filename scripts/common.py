@@ -30,9 +30,7 @@ def make_session():
     # Send secret key to Cloudflare Worker if configured
     proxy_key = os.environ.get("SPAIN_PROXY_KEY")
     if proxy_key:
-        headers["X-API-Key"] = proxy_key
-
-    session.headers.update(headers)
+        session.headers["X-API-Key"] = proxy_key
     
     # Allow retries on protocol-level connection drops (like reset by peer)
     retry_strategy = Retry(
