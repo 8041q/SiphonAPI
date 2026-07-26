@@ -30,23 +30,31 @@ FUEL_FIELDS = {
     # Traditional Gasoline
     "Precio Gasolina 95 E5": "gasoline95",
     "Precio Gasolina 95 E10": "gasoline95E10",
+    "Precio Gasolina 95 E25": "gasoline95E25",
     "Precio Gasolina 95 E5 Premium": "gasoline95Premium",
+    "Precio Gasolina 95 E85": "gasoline95E85",
     "Precio Gasolina 98 E5": "gasoline98",
     "Precio Gasolina 98 E10": "gasoline98E10",
-    
+    "Precio Gasolina Renovable": "gasolineRenewable",
+
     # Diesel
     "Precio Gasoleo A": "diesel",
     "Precio Gasoleo Premium": "dieselPremium",
     "Precio Gasoleo B": "dieselB",  # Agricultural / heating
-    "Precio Gasoleo C": "dieselC",  # Industrial heating
-    
+    "Precio Diésel Renovable": "dieselRenewable",
+
     # Biofuels & Alternative Gases
     "Precio Bioetanol": "bioethanol",
     "Precio Biodiesel": "biodiesel",
     "Precio Gases licuados del petróleo": "lpg",  # GLP
     "Precio Gas Natural Comprimido": "cng",      # GNC
     "Precio Gas Natural Licuado": "lng",         # GNL
+    "Precio Biogas Natural Comprimido": "bioCng",
+    "Precio Biogas Natural Licuado": "bioLng",
     "Precio Hidrogeno": "hydrogen",
+    "Precio Amoniaco": "ammonia",
+    "Precio Metanol": "methanol",
+    "Precio Adblue": "adblue",
 }
 
 GRID_SIZE_DEGREES = 1  # smaller = more, smaller tile files
@@ -78,8 +86,21 @@ def station_to_feature(raw):
             "address": raw.get("Dirección"),
             "municipality": raw.get("Municipio"),
             "province": raw.get("Provincia"),
+            "postalCode": raw.get("C.P."),
             "schedule": raw.get("Horario"),
             "fuels": fuels,
+            "extra": {
+                "saleType": raw.get("Tipo Venta"),  # e.g. "P" = público (retail)
+                "margin": raw.get("Margen"),  # roadside position: D/I/N
+                # "Remisión" is a reporting-frequency code (values seen: "dm",
+                # "OM") from MINETUR's own submission rules
+                # Kept as-is rather than guessing
+                "reportingType": raw.get("Remisión"),
+                "ideess": raw.get("IDEESS"),
+                "idMunicipio": raw.get("IDMunicipio"),
+                "idProvincia": raw.get("IDProvincia"),
+                "idCCAA": raw.get("IDCCAA"),
+            },
         },
     }
 

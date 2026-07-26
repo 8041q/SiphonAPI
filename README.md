@@ -1,97 +1,98 @@
 # fuel-prices-api
 
-A free, open-source, non-commercial data pipeline that turns Portugal's and
-Spain's official fuel price feeds into a simple, versioned, geo-partitioned
-GeoJSON API - hosted entirely on GitHub, no server required.
+A free, open-source, non-commercial data pipeline that fetches official fuel price feeds from **Portugal** and **Spain**, normalizes them into a unified schema, and publishes them as versioned, geo-partitioned **GeoJSON** APIs. Hosted entirely on GitHub.
 
-A scheduled GitHub Action fetches both government sources, normalizes them
-into one schema, and commits the result back into this repo. Because it's a
-public repo, the data is then servable as a free CDN-backed API via
-[jsDelivr](https://www.jsdelivr.com/):
+A scheduled GitHub Action runs the fetchers, normalizes the data, and commits the output back to this repository. The resulting files can be served globally via free CDN networks like [jsDelivr](https://www.jsdelivr.com/):
 
-```
+```text
 https://cdn.jsdelivr.net/gh/YOUR-USERNAME/YOUR-REPO@main/data/es/manifest.json
 https://cdn.jsdelivr.net/gh/YOUR-USERNAME/YOUR-REPO@main/data/es/grid_40_-3.geojson
 https://cdn.jsdelivr.net/gh/YOUR-USERNAME/YOUR-REPO@main/data/pt/manifest.json
 https://cdn.jsdelivr.net/gh/YOUR-USERNAME/YOUR-REPO@main/data/pt/district_lisboa.geojson
 ```
 
-## Sources & credit
 
-- **Portugal**: [DGEG](https://precoscombustiveis.dgeg.gov.pt) (Direção-Geral
-  de Energia e Geologia). DGEG states this data is free to use but **may not
-  be used commercially** - fine for this project, but keep that in mind if
-  you build on top of it.
-- **Spain**: [MINETUR](https://sedeaplicaciones.minetur.gob.es) (Ministerio
-  de Industria, Comercio y Turismo).
+## How Smart Fetching Works
 
-This repo's own code (see `LICENSE`) - covers the
-*code*, not the underlying price data, which stays subject to DGEG's and
-MINETUR's own terms.
+Both scripts rely on smart caching and content-hashing to keep GitHub commits minimal and prevent redundant requests. As to also avoid rate limits.
 
-## Why a repo instead of a server
+* **Network Resiliency (`common.py`)**: Standardizes HTTP sessions with browser User-Agent impersonation (preventing Web Application Firewall drops) and automated exponential backoff retries for transient HTTP errors (429, 500, 502, etc.).
+* **Content Hashing (`common.py`)**: `write_json_if_changed()` hashes output objects via SHA-256 before writing to disk, ensuring unchanged data does not trigger a disk write or Git diff.
+* **Spain (`fetch_spain.py`)**: Spain (MINETUR) publishes a national dataset with a global `Fecha` timestamp. The script compares this timestamp with `state/es_last_fetch.json` and short-circuits execution if the timestamp is unchanged.
+* **Portugal (`fetch_portugal.py`)**: DGEG updates stations granularly. Per-station fuel update timestamps (`DataAtualizacao`) are tracked in `state/pt_stations.json`.
+* **Station Enrichment (`fetch_portugal.py`)**: Portugal stations undergo an additional enrichment pass (`state/pt_enrichment.json`) to pull operating hours, payment methods, amenities, and observations. Cached enrichment data is decoupled from prices and re-fetched only when older than **30 days** (`ENRICHMENT_MAX_AGE_DAYS`) or for newly discovered stations, using polite rate limiting (`0.15s` delay between station lookups).
 
-- Zero hosting cost, zero server to maintain.
-- Git gives you a free, browsable history of price changes.
-- jsDelivr gives real CDN caching in front of a plain GitHub repo.
-- The scheduled fetch, run once for everyone, naturally rate-limits calls
-  to the two government APIs instead of every app install hitting them
-  directly.
 
-## How the "smart fetching" works
+## Data Schema
 
-**Spain** publishes one JSON dump for the whole country, stamped with a
-single `Fecha` timestamp, refreshed about once a day. `fetch_spain.py`
-checks that timestamp against the last one it saw (`state/es_last_fetch.json`)
-and does nothing at all - no parsing, no writes, no commit - on every run
-where it hasn't changed.
-
-**Portugal** has no single "anything changed" flag; each station has its
-own `DataAtualizacao`. `fetch_portugal.py` keeps the last-seen timestamp per
-station+fuel in `state/pt_stations.json` and only rewrites the district
-files that actually contain a changed station.
-
-In both cases, `common.write_json_if_changed()` also compares file content
-directly before writing, so even a full rebuild never produces a git diff
-unless something genuinely changed.
-
-The hourly workflow (`update-data.yml`) then only commits/pushes if
-`git diff` actually finds something - most hourly runs will do nothing.
-
-A separate `keepalive.yml` runs monthly and makes a one-line timestamp
-commit **only if** there's been no real commit in 45+ days, since GitHub
-auto-disables scheduled workflows after 60 days of total repo inactivity.
-
-## Running locally
-
-```bash
-pip install -r requirements.txt
-python scripts/fetch_spain.py
-python scripts/fetch_portugal.py
-```
-
-## Data format
-
-Each `.geojson` file is a standard `FeatureCollection` of `Point` features -
-openable directly in GitHub's own file viewer as a map, and consumable by
-any mapping library (Leaflet, Mapbox, `react-native-maps`, etc.).
+Every `.geojson` file is a valid GeoJSON `FeatureCollection` containing `Point` features.
 
 ```json
 {
   "type": "Feature",
-  "geometry": { "type": "Point", "coordinates": [lng, lat] },
+  "geometry": {
+    "type": "Point",
+    "coordinates": [-9.1393, 38.7223]
+  },
   "properties": {
     "id": "pt-67360",
     "source": "PT",
-    "brand": "INTERMARCHÉ",
-    "address": "...",
-    "fuels": { "gasoline95": 1.729 },
-    "lastUpdated": "2026-07-22 08:40"
+    "name": "Station Name",
+    "brand": "GALP",
+    "address": "Av. Liberdade",
+    "municipality": "Lisboa",
+    "district": "Lisboa",
+    "postalCode": "1250-001",
+    "lastUpdated": "2026-07-22 08:40",
+    "fuels": {
+      "gasoline95": 1.729,
+      "diesel": 1.589,
+      "lpg": 0.849
+    },
+    "hours": {
+      "weekdays": "07:00-22:00",
+      "saturday": "08:00-20:00",
+      "sunday": "08:00-20:00",
+      "holiday": "Closed"
+    },
+    "services": ["Car Wash", "Air Pump"],
+    "paymentMethods": ["Credit Card", "Cash"],
+    "otherServices": "Store",
+    "observations": "Self-service late at night",
+    "extra": {
+      "stationType": "P"
+    }
   }
 }
 ```
 
-Spain is partitioned into 1x1 degree grid tiles (`data/es/grid_{lat}_{lng}.geojson`),
-Portugal into districts (`data/pt/district_{name}.geojson`), each with a
-`manifest.json` listing what's available. A mobile client should fetch the
-manifest first, then only the tiles/districts it actually needs.
+### Supported Fuel Types Across Sources
+
+#### Gasoline
+* `gasoline95` / `gasoline95E10` / `gasoline95E25` / `gasoline95E85` / `gasoline95Premium`
+* `gasoline98` / `gasoline98E10` / `gasoline98Plus`
+* `gasolineMix` (2-stroke)
+* `gasolineRenewable`
+
+#### Diesel
+* `diesel` (Standard Gasóleo / Gasoleo A)
+* `dieselPremium` (Especial / Premium)
+* `dieselB` / `dieselAgri` (Agricultural)
+* `dieselHeating` (Aquecimento)
+* `dieselRenewable`
+
+#### Gas & Alternative Energies
+* `lpg` (GPL Auto)
+* `cng`(m3/kg) / `bioCng` (Compressed Natural Gas / Bio-CNG)
+* `lng` / `bioLng` (Liquefied Natural Gas / Bio-LNG)
+* `hydrogen`
+* `bioethanol` / `biodiesel`
+* `adblue`
+* `ammonia` / `methanol`
+
+##  Sources & Data Licenses
+
+* **Portugal**: Data provided by [DGEG](https://precoscombustiveis.dgeg.gov.pt) (Direção-Geral de Energia e Geologia). DGEG data is free to use for **non-commercial applications**.
+* **Spain**: Data provided by [MINETUR](https://sedeaplicaciones.minetur.gob.es) (Ministerio de Industria, Comercio y Turismo). Spanish public dataset used under open government data terms (attribution required).
+
+*Note: This repository's source code is distributed under its explicit license file (`LICENSE`), which applies strictly to the code execution logic - not to the underlying government price datasets.*

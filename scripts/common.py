@@ -12,7 +12,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-USER_AGENT = "fuel-prices-api/1.0 (+https://github.com/8041q/SiphonAPI)"
+# USER_AGENT = "fuel-prices-api/1.0 (+https://github.com/8041q/SiphonAPI)"
+# Impersonate a standard desktop browser to prevent WAF connection resets
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 def make_session():
     session = requests.Session()
@@ -20,15 +22,16 @@ def make_session():
         {
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
+            "Connection": "keep-alive",
         }
     )
 
-    # Config retries for connection drops and temporary server errors (5xx, 429)
+    # Allow retries on protocol-level connection drops (like reset by peer)
     retry_strategy = Retry(
-        total=3,
-        backoff_factor=30,  # Waits 30s, then 60s, then 90s between retries
+        total=4,
+        backoff_factor=10,  # Exponential backoff: 10s, 20s, 30s, 40s...
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
+        raise_on_status=False,
     )
 
     adapter = HTTPAdapter(max_retries=retry_strategy)
