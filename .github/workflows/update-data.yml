@@ -44,6 +44,9 @@ jobs:
       - name: Fetch Portugal
         run: python scripts/fetch_portugal.py
 
+      - name: Build price history
+        run: python scripts/build_history.py
+
       - name: Build root manifest
         run: python scripts/build_manifest.py
 

@@ -54,6 +54,85 @@ def fetch_json(session, url, timeout=60):
     return resp.json()
 
 
+# Bounding boxes used to detect swapped lat/lng coordinates. Each country's
+# lat range and lng range never overlap, so a swapped pair always falls
+# outside every box (usually in the ocean). Boxes are unions of the
+# mainland + island territories per country.
+COUNTRY_BBOXES = {
+    "ES": [
+        # Mainland + Balearic Islands
+        (-9.5, 35.0, 4.5, 44.0),
+        # Canary Islands
+        (-18.2, 27.5, -13.3, 29.5),
+    ],
+    "PT": [
+        # Mainland
+        (-9.7, 36.9, -6.1, 42.2),
+        # Azores
+        (-31.5, 36.8, -24.5, 39.8),
+        # Madeira
+        (-17.4, 32.6, -16.2, 33.2),
+    ],
+}
+
+# Fields crowdsourced overrides may replace. Prices (fuels) are excluded on purpose
+OVERRIDE_FIELDS = (
+    "paymentMethods",
+    "services",
+    "brand",
+    "name",
+    "schedule",
+    "hours",
+    "address",
+    "otherServices",
+    "observations",
+)
+
+
+def point_in_bboxes(lat, lng, boxes):
+    for west, south, east, north in boxes:
+        if west <= lng <= east and south <= lat <= north:
+            return True
+    return False
+
+
+def validate_station_coords(country, lat, lng):
+    # Returns the corrected (lat, lng) pair, or None if the coordinates
+    # can't be made to fit the country's bounding boxes at all.
+    boxes = COUNTRY_BBOXES.get(country)
+    if boxes is None:
+        return (lat, lng)
+    if point_in_bboxes(lat, lng, boxes):
+        return (lat, lng)
+    if point_in_bboxes(lng, lat, boxes):
+        return (lng, lat)
+    return None
+
+
+def apply_overrides(features, overrides_path):
+    # Final-pass merge: crowdsourced corrections (validated by the maintainer
+    # in data/overrides/<country>.json) replace whitelisted properties on the
+    # published features. Returns the (possibly modified) features list.
+    overrides = load_json(overrides_path, default={})
+    if not overrides:
+        return features
+
+    applied = 0
+    for feature in features:
+        props = feature.get("properties", {})
+        override = overrides.get(props.get("id"))
+        if not override:
+            continue
+        for field in OVERRIDE_FIELDS:
+            if field in override:
+                props[field] = override[field]
+        applied += 1
+
+    if applied:
+        print(f"Overrides: applied corrections to {applied} station(s).")
+    return features
+
+
 def content_hash(obj):
     # Order-independent content hash. Used to decide whether to write a file
     # at all, AND embedded directly in the manifests

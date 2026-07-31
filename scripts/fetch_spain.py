@@ -14,12 +14,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
+    apply_overrides,
     bbox_from_features,
     content_hash,
     fetch_json,
     load_json,
     make_session,
     parse_es_number,
+    validate_station_coords,
     write_json_if_changed,
 )
 
@@ -29,6 +31,7 @@ from common import (  # noqa: E402
 SOURCE_URL = os.environ.get("SPAIN_SOURCE_URL")
 STATE_PATH = "state/es_last_fetch.json"
 DATA_DIR = "data/es"
+OVERRIDES_PATH = "data/overrides/es.json"
 
 FUEL_FIELDS = {
     # Traditional Gasoline
@@ -68,11 +71,19 @@ def grid_key(lat, lng):
     return f"grid_{math.floor(lat / GRID_SIZE_DEGREES)}_{math.floor(lng / GRID_SIZE_DEGREES)}"
 
 
-def station_to_feature(raw):
+def station_to_feature(raw, stats):
     lat = parse_es_number(raw.get("Latitud"))
     lng = parse_es_number(raw.get("Longitud (WGS84)"))
     if lat is None or lng is None:
         return None
+
+    validated = validate_station_coords("ES", lat, lng)
+    if validated is None:
+        stats["dropped"] += 1
+        return None
+    if validated != (lat, lng):
+        stats["swapped"] += 1
+        lat, lng = validated
 
     fuels = {}
     for raw_key, clean_key in FUEL_FIELDS.items():
@@ -122,8 +133,9 @@ def run():
     print(f"Spain: new data (Fecha {current_fecha}), processing...")
 
     tiles = {}
+    stats = {"swapped": 0, "dropped": 0}
     for raw in payload.get("ListaEESSPrecio", []):
-        feature = station_to_feature(raw)
+        feature = station_to_feature(raw, stats)
         if feature is None:
             continue
         lng, lat = feature["geometry"]["coordinates"]
@@ -133,6 +145,7 @@ def run():
     tile_entries = {}
     for key, features in tiles.items():
         features.sort(key=lambda f: f["properties"]["id"])  # deterministic diffs
+        features = apply_overrides(features, OVERRIDES_PATH)
         geojson = {"type": "FeatureCollection", "features": features}
         path = os.path.join(DATA_DIR, f"{key}.geojson")
         if write_json_if_changed(path, geojson):
@@ -156,6 +169,8 @@ def run():
     write_json_if_changed(STATE_PATH, {"fecha": current_fecha})
 
     print(f"Spain: {changed_tiles}/{len(tiles)} tile file(s) actually changed.")
+    if stats["swapped"] or stats["dropped"]:
+        print(f"Spain: swapped {stats['swapped']}, dropped {stats['dropped']} station(s).")
     return True
 
 

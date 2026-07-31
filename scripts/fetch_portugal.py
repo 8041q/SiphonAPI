@@ -17,12 +17,14 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import (  # noqa: E402
+    apply_overrides,
     bbox_from_features,
     content_hash,
     fetch_json,
     load_json,
     make_session,
     parse_pt_price,
+    validate_station_coords,
     write_json_if_changed,
 )
 
@@ -32,6 +34,7 @@ MAP_URL = "https://precoscombustiveis.dgeg.gov.pt/api/PrecoComb/GetDadosPostoMap
 STATE_PATH = "state/pt_stations.json"
 ENRICHMENT_STATE_PATH = "state/pt_enrichment.json"
 DATA_DIR = "data/pt"
+OVERRIDES_PATH = "data/overrides/pt.json"
 
 # How long a cached enrichment record is considered good before we bother
 # DGEG for it again. Hours/services/payment methods change rarely, so this
@@ -46,7 +49,7 @@ FUEL_TYPES = {
     # Gasoline
     3201: "gasoline95",      # Gasolina simples 95
     3205: "gasoline95Plus",  # Gasolina especial 95
-    3210: "gasoline98",      # Gasolina simples 98
+    3401: "gasoline98",      # Gasolina simples 98
     3400: "gasoline98Plus",  # Gasolina especial 98
     3210: "gasolineMix",     # Gasolina mistura (2-stroke)
 
@@ -235,9 +238,17 @@ def run():
     enrich_stations(session, stations, enrichment_cache)
 
     by_district = {}
+    stats = {"swapped": 0, "dropped": 0}
     for sid, station in stations.items():
         if station["lat"] is None or station["lng"] is None:
             continue
+        validated = validate_station_coords("PT", station["lat"], station["lng"])
+        if validated is None:
+            stats["dropped"] += 1
+            continue
+        if validated != (station["lat"], station["lng"]):
+            stats["swapped"] += 1
+            station["lat"], station["lng"] = validated
         feature = {
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [station["lng"], station["lat"]]},
@@ -251,6 +262,7 @@ def run():
     data_updated_through = None
     for district, features in by_district.items():
         features.sort(key=lambda f: f["properties"]["id"])  # deterministic diffs
+        features = apply_overrides(features, OVERRIDES_PATH)
         geojson = {"type": "FeatureCollection", "features": features}
         path = os.path.join(DATA_DIR, f"district_{district}.geojson")
         if write_json_if_changed(path, geojson):
@@ -278,6 +290,8 @@ def run():
     write_json_if_changed(ENRICHMENT_STATE_PATH, enrichment_cache)
 
     print(f"Portugal: {changed_files}/{len(by_district)} district file(s) actually changed.")
+    if stats["swapped"] or stats["dropped"]:
+        print(f"Portugal: swapped {stats['swapped']}, dropped {stats['dropped']} station(s).")
 
     return True
 

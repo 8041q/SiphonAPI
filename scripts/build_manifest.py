@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from common import content_hash, load_json, write_json_if_changed  # noqa: E402
 
 MANIFEST_PATH = "manifest.json"
+HISTORY_INDEX_PATH = "data/history/index.json"
 
 COUNTRY_MANIFESTS = {
     "ES": "data/es/manifest.json",
@@ -26,6 +27,7 @@ COUNTRY_MANIFESTS = {
 def run():
     existing = load_json(MANIFEST_PATH, default={})
     existing_countries = existing.get("countries", {})
+    existing_history = existing.get("history")
 
     countries = {}
     for code, path in COUNTRY_MANIFESTS.items():
@@ -41,17 +43,28 @@ def run():
             or country_manifest.get("dataUpdatedThrough"),
         }
 
-    if countries == existing_countries:
-        print("Root manifest: no country manifest changed, skipping.")
+    history_index = load_json(HISTORY_INDEX_PATH)
+    history = None
+    if history_index is not None:
+        history = {
+            "path": HISTORY_INDEX_PATH.replace(os.sep, "/"),
+            "hash": content_hash(history_index),
+            "lastUpdated": history_index.get("lastUpdated"),
+        }
+
+    if countries == existing_countries and history == existing_history:
+        print("Root manifest: nothing changed, skipping.")
         return False
 
     manifest = {
-        "version": 1,
+        "version": 2,
         # Only advances when a country's hash actually changed, not on every run 
         # this stays a meaningful "last real change" signal instead of "last time the workflow happened to run"
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "countries": countries,
     }
+    if history is not None:
+        manifest["history"] = history
 
     write_json_if_changed(MANIFEST_PATH, manifest)
     print("Root manifest: updated ->", ", ".join(sorted(countries)))
