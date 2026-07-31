@@ -33,6 +33,7 @@ MAP_URL = "https://precoscombustiveis.dgeg.gov.pt/api/PrecoComb/GetDadosPostoMap
 
 STATE_PATH = "state/pt_stations.json"
 ENRICHMENT_STATE_PATH = "state/pt_enrichment.json"
+OVERRIDES_STATE_PATH = "state/pt_overrides.json"
 DATA_DIR = "data/pt"
 OVERRIDES_PATH = "data/overrides/pt.json"
 
@@ -184,6 +185,7 @@ def run():
     session = make_session()
     state = load_json(STATE_PATH, default={})  # {fuel_key: DataAtualizacao}
     enrichment_cache = load_json(ENRICHMENT_STATE_PATH, default={})  # {sid: {...}}
+    override_state = load_json(OVERRIDES_STATE_PATH, default={})  # {"hash": ...}
 
     stations = {}
     changed_ids = set()
@@ -225,11 +227,15 @@ def run():
                 changed_ids.add(sid)
                 state.setdefault(sid, {})[fuel_key] = updated
 
-    if not changed_ids:
+    overrides_hash = content_hash(load_json(OVERRIDES_PATH, default={}))
+    if not changed_ids and override_state.get("hash") == overrides_hash:
         print("Portugal: no station updates found, skipping write.")
         return False
 
-    print(f"Portugal: {len(changed_ids)} station(s) changed.")
+    if changed_ids:
+        print(f"Portugal: {len(changed_ids)} station(s) changed.")
+    else:
+        print("Portugal: no station price updates; overrides changed, reprocessing.")
 
     # Enrichment pass -- once per unique station (see enrich_stations), not
     # once per fuel type. On a cold start (empty cache) this enriches every
@@ -238,13 +244,14 @@ def run():
     enrich_stations(session, stations, enrichment_cache)
 
     by_district = {}
-    stats = {"swapped": 0, "dropped": 0}
+    stats = {"swapped": 0, "dropped": []}
     for sid, station in stations.items():
         if station["lat"] is None or station["lng"] is None:
+            stats["dropped"].append(station["id"])
             continue
         validated = validate_station_coords("PT", station["lat"], station["lng"])
         if validated is None:
-            stats["dropped"] += 1
+            stats["dropped"].append(station["id"])
             continue
         if validated != (station["lat"], station["lng"]):
             stats["swapped"] += 1
@@ -288,10 +295,12 @@ def run():
     write_json_if_changed(os.path.join(DATA_DIR, "manifest.json"), manifest)
     write_json_if_changed(STATE_PATH, state)
     write_json_if_changed(ENRICHMENT_STATE_PATH, enrichment_cache)
+    write_json_if_changed(OVERRIDES_STATE_PATH, {"hash": overrides_hash})
 
     print(f"Portugal: {changed_files}/{len(by_district)} district file(s) actually changed.")
     if stats["swapped"] or stats["dropped"]:
-        print(f"Portugal: swapped {stats['swapped']}, dropped {stats['dropped']} station(s).")
+        print(f"Portugal: swapped {stats['swapped']} station(s).")
+        print(f"Portugal: dropped {len(stats['dropped'])} station(s): {', '.join(stats['dropped'])}.")
 
     return True
 

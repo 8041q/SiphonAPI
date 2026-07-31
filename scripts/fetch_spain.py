@@ -75,11 +75,12 @@ def station_to_feature(raw, stats):
     lat = parse_es_number(raw.get("Latitud"))
     lng = parse_es_number(raw.get("Longitud (WGS84)"))
     if lat is None or lng is None:
+        stats["dropped"].append(f"es-{raw.get('IDEESS') or 'unknown'}")
         return None
 
     validated = validate_station_coords("ES", lat, lng)
     if validated is None:
-        stats["dropped"] += 1
+        stats["dropped"].append(f"es-{raw.get('IDEESS') or 'unknown'}")
         return None
     if validated != (lat, lng):
         stats["swapped"] += 1
@@ -126,14 +127,19 @@ def run():
     current_fecha = payload.get("Fecha")
 
     state = load_json(STATE_PATH, default={})
-    if state.get("fecha") == current_fecha:
+    overrides_hash = content_hash(load_json(OVERRIDES_PATH, default={}))
+    overrides_changed = state.get("overridesHash") != overrides_hash
+    if state.get("fecha") == current_fecha and not overrides_changed:
         print(f"Spain: no update (Fecha still {current_fecha}), skipping.")
         return False
 
-    print(f"Spain: new data (Fecha {current_fecha}), processing...")
+    if overrides_changed:
+        print(f"Spain: Fecha unchanged but overrides changed, reprocessing...")
+    else:
+        print(f"Spain: new data (Fecha {current_fecha}), processing...")
 
     tiles = {}
-    stats = {"swapped": 0, "dropped": 0}
+    stats = {"swapped": 0, "dropped": []}
     for raw in payload.get("ListaEESSPrecio", []):
         feature = station_to_feature(raw, stats)
         if feature is None:
@@ -166,11 +172,12 @@ def run():
     }
 
     write_json_if_changed(os.path.join(DATA_DIR, "manifest.json"), manifest)
-    write_json_if_changed(STATE_PATH, {"fecha": current_fecha})
+    write_json_if_changed(STATE_PATH, {"fecha": current_fecha, "overridesHash": overrides_hash})
 
     print(f"Spain: {changed_tiles}/{len(tiles)} tile file(s) actually changed.")
     if stats["swapped"] or stats["dropped"]:
-        print(f"Spain: swapped {stats['swapped']}, dropped {stats['dropped']} station(s).")
+        print(f"Spain: swapped {stats['swapped']} station(s).")
+        print(f"Spain: dropped {len(stats['dropped'])} station(s): {', '.join(stats['dropped'])}.")
     return True
 
 

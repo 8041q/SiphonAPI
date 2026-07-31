@@ -58,8 +58,9 @@ def run():
 
     manifest = {
         "version": 2,
-        # Only advances when a country's hash actually changed, not on every run 
-        # this stays a meaningful "last real change" signal instead of "last time the workflow happened to run"
+        # Only advances when a country's hash or the history index hash actually
+        # changed, not on every run. This stays a meaningful "last real change"
+        # signal instead of "last time the workflow happened to run".
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "countries": countries,
     }
