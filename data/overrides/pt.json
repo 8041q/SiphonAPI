@@ -1,0 +1,8 @@
+{
+  "pt-EXAMPLE": {
+    "services": ["Loja", "Casa de Banho"],
+    "paymentMethods": ["Dinheiro", "Cartão de Crédito"],
+    "appliedAt": "2026-07-31T00:00:00Z",
+    "note": "issue #14"
+  }
+}

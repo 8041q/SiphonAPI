@@ -151,7 +151,7 @@ def run():
     tile_entries = {}
     for key, features in tiles.items():
         features.sort(key=lambda f: f["properties"]["id"])  # deterministic diffs
-        features = apply_overrides(features, OVERRIDES_PATH)
+        features = apply_overrides(features, OVERRIDES_PATH, country="ES")
         geojson = {"type": "FeatureCollection", "features": features}
         path = os.path.join(DATA_DIR, f"{key}.geojson")
         if write_json_if_changed(path, geojson):

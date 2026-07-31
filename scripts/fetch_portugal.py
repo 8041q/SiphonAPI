@@ -269,7 +269,7 @@ def run():
     data_updated_through = None
     for district, features in by_district.items():
         features.sort(key=lambda f: f["properties"]["id"])  # deterministic diffs
-        features = apply_overrides(features, OVERRIDES_PATH)
+        features = apply_overrides(features, OVERRIDES_PATH, country="PT")
         geojson = {"type": "FeatureCollection", "features": features}
         path = os.path.join(DATA_DIR, f"district_{district}.geojson")
         if write_json_if_changed(path, geojson):

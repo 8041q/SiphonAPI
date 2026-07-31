@@ -88,6 +88,49 @@ OVERRIDE_FIELDS = (
     "observations",
 )
 
+# Which whitelisted fields each country actually publishes. Overriding a field
+# the source doesn't emit would fabricate data the app then renders.
+OVERRIDE_FIELDS_BY_COUNTRY = {
+    "ES": ("brand", "address", "schedule"),
+    "PT": (
+        "brand",
+        "name",
+        "address",
+        "hours",
+        "services",
+        "paymentMethods",
+        "otherServices",
+        "observations",
+    ),
+}
+
+
+def _is_str_list(value):
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_hours(value):
+    # DGEG hours shape: { weekdays, saturday, sunday, holiday }, each string or null
+    if not isinstance(value, dict):
+        return False
+    allowed = {"weekdays", "saturday", "sunday", "holiday"}
+    if not set(value).issubset(allowed):
+        return False
+    return all(item is None or isinstance(item, str) for item in value.values())
+
+
+OVERRIDE_VALIDATORS = {
+    "brand": lambda v: isinstance(v, str),
+    "name": lambda v: isinstance(v, str),
+    "address": lambda v: isinstance(v, str),
+    "schedule": lambda v: isinstance(v, str),
+    "hours": _is_hours,
+    "services": _is_str_list,
+    "paymentMethods": _is_str_list,
+    "otherServices": lambda v: isinstance(v, str),
+    "observations": lambda v: isinstance(v, str),
+}
+
 
 def point_in_bboxes(lat, lng, boxes):
     for west, south, east, north in boxes:
@@ -109,27 +152,54 @@ def validate_station_coords(country, lat, lng):
     return None
 
 
-def apply_overrides(features, overrides_path):
+def apply_overrides(features, overrides_path, country=None):
     # Final-pass merge: crowdsourced corrections (validated by the maintainer
     # in data/overrides/<country>.json) replace whitelisted properties on the
     # published features. Returns the (possibly modified) features list.
+    #
+    # Every entry is checked before it is applied: unknown fields, fields the
+    # country doesn't publish, and values with the wrong shape are rejected with
+    # a warning instead of being shipped to the app. `appliedAt` / `note` are
+    # maintainer metadata and are never published.
     overrides = load_json(overrides_path, default={})
     if not overrides:
         return features
 
+    allowed = OVERRIDE_FIELDS_BY_COUNTRY.get(country, OVERRIDE_FIELDS)
     applied = 0
+    rejected = 0
     for feature in features:
         props = feature.get("properties", {})
-        override = overrides.get(props.get("id"))
+        sid = props.get("id")
+        override = overrides.get(sid)
         if not override:
             continue
-        for field in OVERRIDE_FIELDS:
-            if field in override:
-                props[field] = override[field]
+        for field, value in override.items():
+            if field in ("appliedAt", "note"):
+                continue
+            if field not in OVERRIDE_FIELDS:
+                print(f"Overrides: {sid}: ignoring unknown field {field!r}.")
+                rejected += 1
+                continue
+            if field not in allowed:
+                print(f"Overrides: {sid}: ignoring {field!r} — not a {country} field.")
+                rejected += 1
+                continue
+            if not OVERRIDE_VALIDATORS[field](value):
+                print(
+                    f"Overrides: {sid}: ignoring {field!r} — wrong shape "
+                    f"({type(value).__name__}), expected the published format."
+                )
+                rejected += 1
+                continue
+            props[field] = value
         applied += 1
 
-    if applied:
-        print(f"Overrides: applied corrections to {applied} station(s).")
+    if applied or rejected:
+        summary = f"Overrides: applied corrections to {applied} station(s)."
+        if rejected:
+            summary = summary[:-1] + f", rejected {rejected} field(s)."
+        print(summary)
     return features
 
 

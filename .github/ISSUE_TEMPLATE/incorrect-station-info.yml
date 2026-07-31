@@ -1,0 +1,45 @@
+name: Report incorrect station info
+description: Flag a station whose payment methods, services, hours, brand or address are wrong in Siphon.
+title: "[Station report] <station id>"
+labels: [station-report]
+body:
+  - type: input
+    id: station-id
+    attributes:
+      label: Station ID
+      description: >-
+        Open the station in the app and tap "View Price History" - the id in the
+        URL looks like es-12345 or pt-65074. If you can't find it, give the exact
+        address instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: country
+    attributes:
+      label: Country
+      options:
+        - Spain
+        - Portugal
+    validations:
+      required: true
+  - type: checkboxes
+    id: fields
+    attributes:
+      label: What's wrong?
+      options:
+        - label: Payment methods (cash / card / mobile)
+        - label: Services (shop, restroom, ATM...)
+        - label: Opening hours
+        - label: Brand / name
+        - label: Address
+        - label: Other
+  - type: textarea
+    id: correct-info
+    attributes:
+      label: Correct information
+      description: What you observed, and when ("paid by card there yesterday"). A photo helps us verify.
+      placeholder: >-
+        Example: This station accepts credit cards since May 2026 - I paid with
+        one on 2026-07-28.
+    validations:
+      required: true
