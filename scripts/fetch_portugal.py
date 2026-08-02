@@ -50,8 +50,8 @@ FUEL_TYPES = {
     # Gasoline
     3201: "gasoline95",      # Gasolina simples 95
     3205: "gasoline95Plus",  # Gasolina especial 95
-    3401: "gasoline98",      # Gasolina simples 98
-    3400: "gasoline98Plus",  # Gasolina especial 98
+    3400: "gasoline98",      # Gasolina simples 98
+    3405: "gasoline98Plus",  # Gasolina especial 98
     3210: "gasolineMix",     # Gasolina mistura (2-stroke)
 
     # Diesel
