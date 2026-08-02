@@ -113,6 +113,28 @@ Each file is a JSON object keyed by station id:
 | `paymentMethods` | PT only | array of strings |
 | `otherServices` | PT only | string |
 | `observations` | PT only | string |
+| `coordinates` | ES, PT | array `[lng, lat]` - **rescue field**, not a published property |
+
+### `coordinates` rescue
+
+Stations whose coordinates come out of the source as missing, `(0,0)`, or outside the country's bounding boxes are otherwise **dropped** from the output (and logged as such on every fetch run). Because a station needs a valid position just to be placed in a tile, no other override can save one that's been dropped - the fetch scripts validate source coordinates *before* the normal override pass runs.
+
+`coordinates` is the one field that is consumed *during* that coordinate-validation step: if a station's own coords are bad, its override `coordinates` (in GeoJSON order `[lng, lat]`) are validated against the country's bounding boxes and, if valid, used to re-place the station. It is **never written into the published tile** (it only places the station). Once rescued, the station's other overrides (`brand`, `address`, etc.) still apply as usual.
+
+Example - re-publish a station the source dropped because it forgot the coordinates:
+
+```json
+{
+  "es-11988": {
+    "coordinates": [2.1683, 41.3917],
+    "address": "Passatge Moçambic 2, Barcelona",
+    "appliedAt": "2026-08-02T00:00:00Z",
+    "note": "rescue dropped station"
+  }
+}
+```
+
+A `coordinates` value that fails bbox validation is ignored (the station stays dropped), just like any other bad override.
 
 A field valid for one country but sent for the other (e.g. `schedule` on a PT station) is rejected - it's not that country's field.
 

@@ -8,6 +8,7 @@
 
 # manifest.json also carries a content hash + bbox + station count per tile
 
+import glob
 import math
 import os
 import sys
@@ -21,7 +22,7 @@ from common import (  # noqa: E402
     load_json,
     make_session,
     parse_es_number,
-    validate_station_coords,
+    resolve_station_coordinates,
     write_json_if_changed,
 )
 
@@ -71,20 +72,20 @@ def grid_key(lat, lng):
     return f"grid_{math.floor(lat / GRID_SIZE_DEGREES)}_{math.floor(lng / GRID_SIZE_DEGREES)}"
 
 
-def station_to_feature(raw, stats):
+def station_to_feature(raw, stats, overrides):
+    sid = raw.get("IDEESS")
     lat = parse_es_number(raw.get("Latitud"))
     lng = parse_es_number(raw.get("Longitud (WGS84)"))
-    if lat is None or lng is None:
-        stats["dropped"].append(f"es-{raw.get('IDEESS') or 'unknown'}")
+    resolved = resolve_station_coordinates("ES", lat, lng, overrides, f"es-{sid}")
+    if resolved is None:
+        stats["dropped"].append(f"es-{sid or 'unknown'}")
         return None
-
-    validated = validate_station_coords("ES", lat, lng)
-    if validated is None:
-        stats["dropped"].append(f"es-{raw.get('IDEESS') or 'unknown'}")
-        return None
-    if validated != (lat, lng):
+    new_lat, new_lng, from_override = resolved
+    if from_override:
+        stats["rescued"].append(f"es-{sid or 'unknown'}")
+    elif (new_lat, new_lng) != (lat, lng):
         stats["swapped"] += 1
-        lat, lng = validated
+    lat, lng = new_lat, new_lng
 
     fuels = {}
     for raw_key, clean_key in FUEL_FIELDS.items():
@@ -127,7 +128,8 @@ def run():
     current_fecha = payload.get("Fecha")
 
     state = load_json(STATE_PATH, default={})
-    overrides_hash = content_hash(load_json(OVERRIDES_PATH, default={}))
+    overrides = load_json(OVERRIDES_PATH, default={})
+    overrides_hash = content_hash(overrides)
     overrides_changed = state.get("overridesHash") != overrides_hash
     if state.get("fecha") == current_fecha and not overrides_changed:
         print(f"Spain: no update (Fecha still {current_fecha}), skipping.")
@@ -139,13 +141,20 @@ def run():
         print(f"Spain: new data (Fecha {current_fecha}), processing...")
 
     tiles = {}
-    stats = {"swapped": 0, "dropped": []}
+    stats = {"swapped": 0, "dropped": [], "rescued": []}
     for raw in payload.get("ListaEESSPrecio", []):
-        feature = station_to_feature(raw, stats)
+        feature = station_to_feature(raw, stats, overrides)
         if feature is None:
             continue
         lng, lat = feature["geometry"]["coordinates"]
         tiles.setdefault(grid_key(lat, lng), []).append(feature)
+
+    removed_tiles = []
+    for path in glob.glob(os.path.join(DATA_DIR, "grid_*.geojson")):
+        key = os.path.splitext(os.path.basename(path))[0]
+        if key not in tiles:
+            os.remove(path)
+            removed_tiles.append(key)
 
     changed_tiles = 0
     tile_entries = {}
@@ -175,9 +184,15 @@ def run():
     write_json_if_changed(STATE_PATH, {"fecha": current_fecha, "overridesHash": overrides_hash})
 
     print(f"Spain: {changed_tiles}/{len(tiles)} tile file(s) actually changed.")
+    if removed_tiles:
+        print(f"Spain: removed {len(removed_tiles)} stale tile(s): {', '.join(removed_tiles)}.")
+    if stats["rescued"]:
+        print(f"Spain: re-placed {len(stats['rescued'])} station(s) via override coordinates.")
     if stats["swapped"] or stats["dropped"]:
         print(f"Spain: swapped {stats['swapped']} station(s).")
         print(f"Spain: dropped {len(stats['dropped'])} station(s): {', '.join(stats['dropped'])}.")
+        if stats["dropped"]:
+            print("Spain: dropped stations need an override with \"coordinates\" [lng, lat] (or a source fix) to be re-published.")
     return True
 
 

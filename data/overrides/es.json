@@ -1,8 +1,8 @@
 {
-  "es-EXAMPLE": {
-    "brand": "REPSOL",
-    "schedule": "L-D: 24H",
-    "appliedAt": "2026-07-31T00:00:00Z",
-    "note": "issue #12"
-  }
+  "es-11988": {
+    "coordinates": [2.1683, 41.3917],
+    "address": "Passatge Moçambic 2, Barcelona" },
+  "es-12883": {
+    "coordinates": [-3.6761, 40.1903],
+    "address": "Av. de Andalucía 519, Valdemoro" }
 }

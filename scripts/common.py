@@ -86,12 +86,15 @@ OVERRIDE_FIELDS = (
     "address",
     "otherServices",
     "observations",
+    # Rescue field: lets an override re-place a station whose source coords
+    # are missing/(0,0)/off-bbox. Consumed during placement, never published.
+    "coordinates",
 )
 
 # Which whitelisted fields each country actually publishes. Overriding a field
 # the source doesn't emit would fabricate data the app then renders.
 OVERRIDE_FIELDS_BY_COUNTRY = {
-    "ES": ("brand", "address", "schedule"),
+    "ES": ("brand", "address", "schedule", "coordinates"),
     "PT": (
         "brand",
         "name",
@@ -101,6 +104,7 @@ OVERRIDE_FIELDS_BY_COUNTRY = {
         "paymentMethods",
         "otherServices",
         "observations",
+        "coordinates",
     ),
 }
 
@@ -119,6 +123,16 @@ def _is_hours(value):
     return all(item is None or isinstance(item, str) for item in value.values())
 
 
+def _is_coordinates(value):
+    # Override-provided position, GeoJSON order [lng, lat]. Bbox membership is
+    # checked at placement time (needs the country), shape is checked here.
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in value)
+    )
+
+
 OVERRIDE_VALIDATORS = {
     "brand": lambda v: isinstance(v, str),
     "name": lambda v: isinstance(v, str),
@@ -129,6 +143,7 @@ OVERRIDE_VALIDATORS = {
     "paymentMethods": _is_str_list,
     "otherServices": lambda v: isinstance(v, str),
     "observations": lambda v: isinstance(v, str),
+    "coordinates": _is_coordinates,
 }
 
 
@@ -149,6 +164,35 @@ def validate_station_coords(country, lat, lng):
         return (lat, lng)
     if point_in_bboxes(lng, lat, boxes):
         return (lng, lat)
+    return None
+
+
+def resolve_station_coordinates(country, lat, lng, overrides, sid):
+    # Returns a valid (lat, lng) pair (plus a `from_override` bool) for the
+    # station, or None if it can't be placed:
+    #   1. If the source lat/lng are present and fall inside the country (after
+    #      the swap correction), that's used as-is (from_override=False).
+    #   2. Otherwise, if the station has an override providing `coordinates`,
+    #      those are validated against the country bbox and used as the rescue
+    #      path (from_override=True).
+    #   3. Otherwise None -> the caller drops and logs the station.
+    #
+    # A source value of literal 0 (either axis) is treated as missing - it can
+    # never be inside a real country bbox, and calling it "swapped" would be
+    # wrong when an override rescues it.
+    if lat is not None and lng is not None and (lat != 0 or lng != 0):
+        validated = validate_station_coords(country, lat, lng)
+        if validated is not None:
+            return validated[0], validated[1], False
+
+    override = (overrides or {}).get(sid) or {}
+    coords = override.get("coordinates")
+    if _is_coordinates(coords):
+        olng, olat = coords
+        validated = validate_station_coords(country, olat, olng)
+        if validated is not None:
+            return validated[0], validated[1], True
+
     return None
 
 
@@ -176,6 +220,10 @@ def apply_overrides(features, overrides_path, country=None):
             continue
         for field, value in override.items():
             if field in ("appliedAt", "note"):
+                continue
+            if field == "coordinates":
+                # Consumed at placement/rescue time (resolve_station_coordinates),
+                # never written into the published properties.
                 continue
             if field not in OVERRIDE_FIELDS:
                 print(f"Overrides: {sid}: ignoring unknown field {field!r}.")

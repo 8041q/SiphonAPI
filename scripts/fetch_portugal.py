@@ -10,6 +10,7 @@
 # manifest.json also carries a content hash + bbox + station count per
 # district, plus generatedAt / dataUpdatedThrough freshness fields
 
+import glob
 import os
 import sys
 import time
@@ -24,7 +25,7 @@ from common import (  # noqa: E402
     load_json,
     make_session,
     parse_pt_price,
-    validate_station_coords,
+    resolve_station_coordinates,
     write_json_if_changed,
 )
 
@@ -227,7 +228,8 @@ def run():
                 changed_ids.add(sid)
                 state.setdefault(sid, {})[fuel_key] = updated
 
-    overrides_hash = content_hash(load_json(OVERRIDES_PATH, default={}))
+    overrides = load_json(OVERRIDES_PATH, default={})
+    overrides_hash = content_hash(overrides)
     if not changed_ids and override_state.get("hash") == overrides_hash:
         print("Portugal: no station updates found, skipping write.")
         return False
@@ -244,18 +246,20 @@ def run():
     enrich_stations(session, stations, enrichment_cache)
 
     by_district = {}
-    stats = {"swapped": 0, "dropped": []}
+    stats = {"swapped": 0, "dropped": [], "rescued": []}
     for sid, station in stations.items():
-        if station["lat"] is None or station["lng"] is None:
+        resolved = resolve_station_coordinates(
+            "PT", station["lat"], station["lng"], overrides, station["id"]
+        )
+        if resolved is None:
             stats["dropped"].append(station["id"])
             continue
-        validated = validate_station_coords("PT", station["lat"], station["lng"])
-        if validated is None:
-            stats["dropped"].append(station["id"])
-            continue
-        if validated != (station["lat"], station["lng"]):
+        new_lat, new_lng, from_override = resolved
+        if from_override:
+            stats["rescued"].append(station["id"])
+        elif (new_lat, new_lng) != (station["lat"], station["lng"]):
             stats["swapped"] += 1
-            station["lat"], station["lng"] = validated
+        station["lat"], station["lng"] = new_lat, new_lng
         feature = {
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [station["lng"], station["lat"]]},
@@ -263,6 +267,13 @@ def run():
         }
         district = (station["district"] or "unknown").strip().lower().replace(" ", "_")
         by_district.setdefault(district, []).append(feature)
+
+    removed_districts = []
+    for path in glob.glob(os.path.join(DATA_DIR, "district_*.geojson")):
+        key = os.path.splitext(os.path.basename(path))[0]
+        if key not in by_district:
+            os.remove(path)
+            removed_districts.append(key)
 
     changed_files = 0
     district_entries = {}
@@ -298,9 +309,15 @@ def run():
     write_json_if_changed(OVERRIDES_STATE_PATH, {"hash": overrides_hash})
 
     print(f"Portugal: {changed_files}/{len(by_district)} district file(s) actually changed.")
+    if removed_districts:
+        print(f"Portugal: removed {len(removed_districts)} stale district file(s): {', '.join(removed_districts)}.")
+    if stats["rescued"]:
+        print(f"Portugal: re-placed {len(stats['rescued'])} station(s) via override coordinates.")
     if stats["swapped"] or stats["dropped"]:
         print(f"Portugal: swapped {stats['swapped']} station(s).")
         print(f"Portugal: dropped {len(stats['dropped'])} station(s): {', '.join(stats['dropped'])}.")
+        if stats["dropped"]:
+            print("Portugal: dropped stations need an override with \"coordinates\" [lng, lat] (or a source fix) to be re-published.")
 
     return True
 

@@ -1,8 +1,5 @@
 {
-  "pt-EXAMPLE": {
-    "services": ["Loja", "Casa de Banho"],
-    "paymentMethods": ["Dinheiro", "Cartão de Crédito"],
-    "appliedAt": "2026-07-31T00:00:00Z",
-    "note": "issue #14"
+  "es-11988": {
+    "coordinates": [-8.30444, 37.16333]
   }
 }
