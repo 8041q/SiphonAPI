@@ -17,6 +17,7 @@ from common import content_hash, load_json, write_json_if_changed  # noqa: E402
 
 MANIFEST_PATH = "manifest.json"
 HISTORY_INDEX_PATH = "data/history/index.json"
+COMMODITIES_DASHBOARD_PATH = "data/commodities/dashboard.json"
 
 COUNTRY_MANIFESTS = {
     "ES": "data/es/manifest.json",
@@ -28,6 +29,7 @@ def run():
     existing = load_json(MANIFEST_PATH, default={})
     existing_countries = existing.get("countries", {})
     existing_history = existing.get("history")
+    existing_commodities = existing.get("commodities")
 
     countries = {}
     for code, path in COUNTRY_MANIFESTS.items():
@@ -52,7 +54,20 @@ def run():
             "lastUpdated": history_index.get("lastUpdated"),
         }
 
-    if countries == existing_countries and history == existing_history:
+    dashboard = load_json(COMMODITIES_DASHBOARD_PATH)
+    commodities = None
+    if dashboard is not None:
+        commodities = {
+            "path": COMMODITIES_DASHBOARD_PATH.replace(os.sep, "/"),
+            "hash": content_hash(dashboard),
+            "lastUpdated": dashboard.get("lastUpdated"),
+        }
+
+    if (
+        countries == existing_countries
+        and history == existing_history
+        and commodities == existing_commodities
+    ):
         print("Root manifest: nothing changed, skipping.")
         return False
 
@@ -66,6 +81,8 @@ def run():
     }
     if history is not None:
         manifest["history"] = history
+    if commodities is not None:
+        manifest["commodities"] = commodities
 
     write_json_if_changed(MANIFEST_PATH, manifest)
     print("Root manifest: updated ->", ", ".join(sorted(countries)))

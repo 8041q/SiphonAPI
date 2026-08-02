@@ -1,14 +1,9 @@
 name: Update fuel price data
 
-# Runs hourly. 
-# Spain's fetch exits almost immediately when nothing has changed since it checks a single timestamp field first,
-# so the hourly schedule costs almost nothing on the days Spain hasn't refreshed.
-# Portugal's fetch does a full per-fuel fetch each run (DGEG has no equivalent
-# single flag), but only writes files for stations that actually changed.
-#
-# build_manifest.py combines both countries' manifests into one small root
-# manifest.json so that there is only a single file a client polls to know whether anything
-# changed anywhere.
+# Runs daily. Fetches Spain and Portugal fuel prices, builds daily price
+# history, pulls Brent/WTI crude closes from FRED, computes a commodity
+# dashboard (crude vs retail correlation), and finally rebuilds the root
+# manifest so the client knows whether anything changed anywhere.
 
 on:
   schedule:
@@ -44,8 +39,17 @@ jobs:
       - name: Fetch Portugal
         run: python scripts/fetch_portugal.py
 
+      ## Build price history
       - name: Build price history
         run: python scripts/build_history.py
+
+      - name: Fetch crude prices (FRED)
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python scripts/fetch_crude.py
+
+      - name: Build commodity dashboard
+        run: python scripts/build_commodities.py
 
       - name: Build root manifest
         run: python scripts/build_manifest.py
