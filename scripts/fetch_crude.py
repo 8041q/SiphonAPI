@@ -1,10 +1,7 @@
 # Fetches daily Brent and WTI spot prices from the FRED API and writes
-# data/commodities/crude.json. Idempotent: on first run it backfills from
-# BACKFILL_START; afterwards it fetches only dates newer than the latest
-# cached one. Non-numeric observations (weekends/holidays) are skipped.
-# Reuses the retry-capable session from common.make_session().
+# data/commodities/crude.json. Each series owns its own recovery cursor and
+# re-fetches a small overlap so transient failures or FRED revisions are healed.
 
-import json
 import os
 import sys
 from datetime import date as dtdate
@@ -19,16 +16,12 @@ SERIES_IDS = {
     "wti": "DCOILWTICO",
 }
 BACKFILL_START = "2025-01-01"
+REFETCH_OVERLAP_DAYS = 14
 CRUDE_PATH = "data/commodities/crude.json"
 
 
-def _fetch_one(session, series_id: str, start_date: str):
-    """Return [{date, value}] for *one* FRED series."""
-    api_key = os.environ.get("FRED_API_KEY", "")
-    if not api_key:
-        print("fetch_crude: FRED_API_KEY not set — skipping.")
-        return []
-
+def _fetch_one(session, series_id: str, start_date: str, api_key: str):
+    """Return [{date, value}] for one FRED series, or None on request failure."""
     params = {
         "series_id": series_id,
         "api_key": api_key,
@@ -39,74 +32,106 @@ def _fetch_one(session, series_id: str, start_date: str):
     try:
         resp = session.get(FRED_URL, params=params, timeout=30)
         resp.raise_for_status()
-    except Exception as exc:
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001 - preserve cached series on any upstream failure
         print(f"fetch_crude: FRED request failed for {series_id}: {exc}")
-        return []
+        return None
 
-    data = resp.json()
+    observations = data.get("observations")
+    if not isinstance(observations, list):
+        print(f"fetch_crude: malformed FRED response for {series_id}; preserving cache.")
+        return None
+
     points = []
-    for obs in data.get("observations", []):
+    for obs in observations:
         try:
             value = float(obs["value"])
-        except (ValueError, TypeError):
+            date = obs["date"]
+            dtdate.fromisoformat(date)
+        except (KeyError, ValueError, TypeError):
             continue
-        points.append({"date": obs["date"], "value": value})
+        points.append({"date": date, "value": value})
     return points
 
 
-def _determine_start(existing_series):
-    """Return the oldest date that still needs fetching."""
-    overall = set()
-    for pts in existing_series.values():
-        for p in pts:
-            overall.add(p["date"])
-    if not overall:
+def _determine_start(existing_points):
+    """Return this series' recovery start date with an overlap for revisions."""
+    dates = []
+    for point in existing_points:
+        try:
+            dates.append(dtdate.fromisoformat(point["date"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not dates:
         return BACKFILL_START
-    latest = max(overall)
-    return (dtdate.fromisoformat(latest) + timedelta(days=1)).isoformat()
+    start = max(dates) - timedelta(days=REFETCH_OVERLAP_DAYS)
+    floor = dtdate.fromisoformat(BACKFILL_START)
+    return max(start, floor).isoformat()
+
+
+def _merge_points(existing_points, fresh_points):
+    """Upsert fetched points by date and report whether the series changed."""
+    before = {p["date"]: p["value"] for p in existing_points if "date" in p and "value" in p}
+    merged = dict(before)
+    for point in fresh_points:
+        merged[point["date"]] = point["value"]
+    changed = merged != before
+    return (
+        [{"date": date, "value": merged[date]} for date in sorted(merged)],
+        changed,
+    )
 
 
 def run():
-    existing = load_json(CRUDE_PATH, default={"source": "FRED", "unit": "USD/barrel", "series": {}})
-    if existing is None:
-        existing = {"source": "FRED", "unit": "USD/barrel", "series": {}}
+    api_key = os.environ.get("FRED_API_KEY", "")
+    if not api_key:
+        print("fetch_crude: FRED_API_KEY not set — preserving existing data.")
+        return False
 
+    existing = load_json(
+        CRUDE_PATH,
+        default={"source": "FRED", "unit": "USD/barrel", "series": {}},
+    ) or {"source": "FRED", "unit": "USD/barrel", "series": {}}
     existing_series = existing.get("series", {})
 
-    start = _determine_start(existing_series)
-    print(f"fetch_crude: starting from {start}")
-
     session = make_session()
-    fresh = {}
-    for name, series_id in SERIES_IDS.items():
-        fresh[name] = _fetch_one(session, series_id, start)
-
     merged = {}
-    total_new = 0
-    for key in SERIES_IDS:
-        existing_points = existing_series.get(key, [])
-        by_date = {p["date"]: p for p in existing_points}
-        added = 0
-        for p in fresh.get(key, []):
-            if p["date"] not in by_date:
-                existing_points.append(p)
-                added += 1
-        existing_points.sort(key=lambda x: x["date"])
-        merged[key] = existing_points
-        total_new += added
+    any_changed = False
+    fetched_any = False
 
-    if total_new == 0:
-        print("fetch_crude: no new observations — skipping write.")
-        return
+    for name, series_id in SERIES_IDS.items():
+        cached = existing_series.get(name, [])
+        start = _determine_start(cached)
+        print(f"fetch_crude: {name} starting from {start}")
+        fresh = _fetch_one(session, series_id, start, api_key)
+        if fresh is None:
+            merged[name] = cached
+            continue
+
+        fetched_any = True
+        merged[name], changed = _merge_points(cached, fresh)
+        any_changed = any_changed or changed
+
+    # Preserve unknown/future series keys rather than silently dropping them.
+    for name, points in existing_series.items():
+        merged.setdefault(name, points)
+
+    if not fetched_any:
+        print("fetch_crude: all FRED requests failed — preserving existing data.")
+        return False
+    if not any_changed:
+        print("fetch_crude: no new or revised observations — skipping write.")
+        return False
 
     crude = {
-        "source": "FRED",
-        "unit": "USD/barrel",
+        "source": existing.get("source", "FRED"),
+        "unit": existing.get("unit", "USD/barrel"),
         "lastUpdated": datetime.now(timezone.utc).isoformat(),
         "series": merged,
     }
     wrote = write_json_if_changed(CRUDE_PATH, crude)
-    print(f"fetch_crude: {total_new} new observation(s), wrote={'yes' if wrote else 'no'}.")
+    print(f"fetch_crude: wrote={'yes' if wrote else 'no'}.")
+    return wrote
 
 
 if __name__ == "__main__":

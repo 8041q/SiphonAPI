@@ -1,12 +1,6 @@
 # Builds the top-level manifest.json at the repo root.
-
-# fetch_spain.py and fetch_portugal.py each already maintain their own
-# manifest (data/es/manifest.json, data/pt/manifest.json) listing their
-# tiles/districts with a hash, bbox and station count apiece. This script
-# just combines those two into one tiny root file, so a client only ever
-# has to fetch ONE small thing to know whether anything changed anywhere,
-
-# Run this after both fetch scripts
+# Existing public paths/keys are preserved; added metadata is optional for older
+# clients and helps newer clients reason about source health/counts.
 
 import os
 import sys
@@ -26,24 +20,25 @@ COUNTRY_MANIFESTS = {
 
 
 def run():
-    existing = load_json(MANIFEST_PATH, default={})
-    existing_countries = existing.get("countries", {})
-    existing_history = existing.get("history")
-    existing_commodities = existing.get("commodities")
+    existing = load_json(MANIFEST_PATH, default={}) or {}
 
     countries = {}
     for code, path in COUNTRY_MANIFESTS.items():
         country_manifest = load_json(path)
         if country_manifest is None:
-            # First run before that country has ever written anything, just skip it rather than fail; it'll appear once it exists.
             continue
-        countries[code] = {
-            "manifest": path,
+        entry = {
+            "manifest": path.replace(os.sep, "/"),
             "hash": content_hash(country_manifest),
-            # Spain calls this lastUpdated, Portugal calls it dataUpdatedThrough - normalize to one field so a client doesn't need to know each country's field name
             "lastUpdated": country_manifest.get("lastUpdated")
             or country_manifest.get("dataUpdatedThrough"),
         }
+        # Additive fields: older clients can ignore them.
+        if country_manifest.get("sourceStatus") is not None:
+            entry["status"] = country_manifest.get("sourceStatus")
+        if country_manifest.get("stationCount") is not None:
+            entry["stationCount"] = country_manifest.get("stationCount")
+        countries[code] = entry
 
     history_index = load_json(HISTORY_INDEX_PATH)
     history = None
@@ -52,6 +47,7 @@ def run():
             "path": HISTORY_INDEX_PATH.replace(os.sep, "/"),
             "hash": content_hash(history_index),
             "lastUpdated": history_index.get("lastUpdated"),
+            "snapshotCount": len(history_index.get("days", [])),
         }
 
     dashboard = load_json(COMMODITIES_DASHBOARD_PATH)
@@ -61,29 +57,30 @@ def run():
             "path": COMMODITIES_DASHBOARD_PATH.replace(os.sep, "/"),
             "hash": content_hash(dashboard),
             "lastUpdated": dashboard.get("lastUpdated"),
+            "status": dashboard.get("status"),
         }
 
-    if (
-        countries == existing_countries
-        and history == existing_history
-        and commodities == existing_commodities
-    ):
+    stable_manifest = {
+        # Keep the existing public version for client compatibility. The new
+        # fields are backward-compatible additions, not a contract break.
+        "version": 2,
+        "schemaVersion": 2,
+        "countries": countries,
+    }
+    if history is not None:
+        stable_manifest["history"] = history
+    if commodities is not None:
+        stable_manifest["commodities"] = commodities
+
+    existing_stable = {k: v for k, v in existing.items() if k != "generatedAt"}
+    if content_hash(existing_stable) == content_hash(stable_manifest):
         print("Root manifest: nothing changed, skipping.")
         return False
 
     manifest = {
-        "version": 2,
-        # Only advances when a country's hash or the history index hash actually
-        # changed, not on every run. This stays a meaningful "last real change"
-        # signal instead of "last time the workflow happened to run".
+        **stable_manifest,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "countries": countries,
     }
-    if history is not None:
-        manifest["history"] = history
-    if commodities is not None:
-        manifest["commodities"] = commodities
-
     write_json_if_changed(MANIFEST_PATH, manifest)
     print("Root manifest: updated ->", ", ".join(sorted(countries)))
     return True

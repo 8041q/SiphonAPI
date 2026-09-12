@@ -1,21 +1,27 @@
 # Shared helpers for the fetch scripts:
-
-# - HTTP session that always sends a proper identifiable User-Agent
-# - JSON read/write helpers that only touch a file on disk when its content has actually changed
+#
+# - HTTP session with retry handling and an identifiable User-Agent
+# - JSON read/write helpers with atomic, write-if-changed publishing
 # - parsers for the odd number formats each source uses
 # - manifest helpers (content_hash / bbox_from_features)
 
 import hashlib
 import json
 import os
+import tempfile
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-# USER_AGENT = "fuel-prices-api/1.0 (+https://github.com/8041q/SiphonAPI)"
-# Impersonate a standard desktop browser to prevent WAF connection resets
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+# The upstream Spain feed/proxy has historically rejected non-browser agents.
+# Keep this here for compatibility, but do not attach source-specific secrets to
+# this shared session: callers must pass those only on the request that needs it.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
 
 def make_session():
     session = requests.Session()
@@ -27,29 +33,28 @@ def make_session():
         }
     )
 
-    # Send secret key to Cloudflare Worker if configured
-    proxy_key = os.environ.get("SPAIN_PROXY_KEY")
-    if proxy_key:
-        session.headers["X-API-Key"] = proxy_key
-    
-    # Allow retries on protocol-level connection drops (like reset by peer)
     retry_strategy = Retry(
         total=4,
-        backoff_factor=10,  # Exponential backoff: 10s, 20s, 30s, 40s...
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=10,
         status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset({"GET", "HEAD"}),
+        respect_retry_after_header=True,
         raise_on_status=False,
     )
 
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-
-
     return session
 
 
-def fetch_json(session, url, timeout=60):
-    resp = session.get(url, timeout=timeout)
+def fetch_json(session, url, timeout=60, headers=None):
+    if not url:
+        raise ValueError("fetch_json: URL is empty or not configured")
+    resp = session.get(url, timeout=timeout, headers=headers)
     resp.raise_for_status()
     return resp.json()
 
@@ -253,7 +258,7 @@ def apply_overrides(features, overrides_path, country=None):
 
 def content_hash(obj):
     # Order-independent content hash. Used to decide whether to write a file
-    # at all, AND embedded directly in the manifests
+    # at all, AND embedded directly in the manifests.
     return hashlib.sha256(
         json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -267,23 +272,55 @@ def load_json(path, default=None):
 
 
 def write_json_if_changed(path, obj):
-    # Writes `obj` to `path` only if it differs from what's already there
-    # Returns True if the file has changes, otherwise it's False
+    """Atomically write JSON only when its content actually changed.
 
+    The temporary file is created in the destination directory so os.replace()
+    stays on the same filesystem. A process interruption therefore leaves either
+    the previous complete JSON file or the new complete JSON file, never a
+    half-written public artifact.
+    """
     existing = load_json(path)
     if existing is not None and content_hash(existing) == content_hash(obj):
         return False
 
-    dirname = os.path.dirname(path)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+    dirname = os.path.dirname(path) or "."
+    os.makedirs(dirname, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=dirname)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+
+        # mkstemp() creates mode 0600. Preserve an existing destination's mode
+        # or use a normal data-file mode for a new public artifact.
+        mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o644
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+
+        # Best-effort directory sync makes the rename itself durable on POSIX.
+        try:
+            dir_fd = os.open(dirname, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
     return True
 
 
 def bbox_from_features(features):
     # [minLng, minLat, maxLng, maxLat] for a list of GeoJSON Point features.
+    if not features:
+        return None
     lngs = [f["geometry"]["coordinates"][0] for f in features]
     lats = [f["geometry"]["coordinates"][1] for f in features]
     return [min(lngs), min(lats), max(lngs), max(lats)]
@@ -300,10 +337,10 @@ def parse_es_number(value):
 
 
 def parse_pt_price(value):
-    # Portugal sends prices like '1,729 \u20ac'
+    # Portugal sends prices like '1,729 €'
     if value in (None, ""):
         return None
-    cleaned = str(value).replace("\u20ac", "").strip().replace(",", ".")
+    cleaned = str(value).replace("€", "").strip().replace(",", ".")
     try:
         return float(cleaned)
     except ValueError:

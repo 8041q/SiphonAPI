@@ -1,14 +1,8 @@
 # Fetches Portugal's DGEG fuel price feed.
-
-# It filters by fuel type via `idsTiposComb`, and each station has its own `DataAtualizacao`.
-# So the delta logic here is per-station: we keep the last-seen `DataAtualizacao` for every
-# (station, fuel) pair in state/pt_stations.json, and only write output files
-# when at least one of those actually changed.
-
+#
+# Delta logic is per (station, fuel), while slow-changing station enrichment is
+# cached separately and may itself trigger a refresh when its TTL expires.
 # Output: one GeoJSON file per district under data/pt/, plus a manifest.json.
-
-# manifest.json also carries a content hash + bbox + station count per
-# district, plus generatedAt / dataUpdatedThrough freshness fields
 
 import glob
 import os
@@ -37,64 +31,56 @@ ENRICHMENT_STATE_PATH = "state/pt_enrichment.json"
 OVERRIDES_STATE_PATH = "state/pt_overrides.json"
 DATA_DIR = "data/pt"
 OVERRIDES_PATH = "data/overrides/pt.json"
+MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
-# How long a cached enrichment record is considered good before we bother
-# DGEG for it again. Hours/services/payment methods change rarely, so this
-# is decoupled from price changes on purpose
 ENRICHMENT_MAX_AGE_DAYS = 30
-
-# First run on a station at least once can be several thousand sequential requests
-# A small delay keeps that from hammering DGEG's server all at once.
 ENRICHMENT_REQUEST_DELAY_SECONDS = 0.15
+MIN_RETAINED_STATION_RATIO = float(os.environ.get("MIN_RETAINED_STATION_RATIO", "0.75"))
 
 FUEL_TYPES = {
-    # Gasoline
-    3201: "gasoline95",      # Gasolina simples 95
-    3205: "gasoline95Plus",  # Gasolina especial 95
-    3400: "gasoline98",      # Gasolina simples 98
-    3405: "gasoline98Plus",  # Gasolina especial 98
-    3210: "gasolineMix",     # Gasolina mistura (2-stroke)
-
-    # Diesel
-    2101: "diesel",          # Gasóleo simples
-    2105: "dieselPremium",   # Gasóleo especial
-    2155: "dieselHeating",   # Gasóleo de aquecimento
-    2150: "dieselAgri",      # Gasóleo colorido e marcado (agrícola)
-    2115: "bioDiesel",      # Biodiesel B15
-
-    # Gas & Alternative
-    1120: "lpg",             # GPL Auto
-    1141: "cngm3",             # GNC (Gás Natural Comprimido - m3)
-    1143: "cngkg",             # GNC (Gás Natural Comprimido - kg)
-    1142: "lng",             # GNL (Gás Natural Liquefeito)
+    3201: "gasoline95",
+    3205: "gasoline95Plus",
+    3400: "gasoline98",
+    3405: "gasoline98Plus",
+    3210: "gasolineMix",
+    2101: "diesel",
+    2105: "dieselPremium",
+    2155: "dieselHeating",
+    2150: "dieselAgri",
+    2115: "bioDiesel",
+    1120: "lpg",
+    1141: "cngm3",
+    1143: "cngkg",
+    1142: "lng",
 }
 
-PAGE_SIZE = 10000  # above Portugal's total stations
+PAGE_SIZE = 10000
 
 
 def fetch_fuel(session, fuel_id):
     url = f"{BASE_URL}?idsTiposComb={fuel_id}&qtdPorPagina={PAGE_SIZE}"
-
     payload = fetch_json(session, url)
-    print(
-        fuel_id,
-        payload.get("status"),
-        len(payload.get("resultado") or []),
-        payload.get("mensagem"),
-    )
-    return payload.get("resultado")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Portugal: fuel {fuel_id} returned non-object JSON.")
+    if not payload.get("status"):
+        raise RuntimeError(
+            f"Portugal: DGEG fuel {fuel_id} returned status=false: "
+            f"{payload.get('mensagem') or 'no message'}"
+        )
+    result = payload.get("resultado")
+    if not isinstance(result, list):
+        raise RuntimeError(f"Portugal: DGEG fuel {fuel_id} returned malformed resultado.")
+    print(fuel_id, payload.get("status"), len(result), payload.get("mensagem"))
+    return result
 
 
 def _clean(value):
-    # DGEG uses "-" as a placeholder for "nothing to report"
     if value in (None, "", "-"):
         return None
     return value
 
 
 def _extract_descriptions(raw_list):
-    # Servicos / MeiosPagamento both are either null or a list of "..."
-    # this stays defensive and also accepts plain strings, just in case.
     if not raw_list:
         return []
     descriptions = []
@@ -109,13 +95,14 @@ def _extract_descriptions(raw_list):
 
 
 def fetch_station_enrichment(session, sid):
-    # One call per station: hours, services, payment methods and notes.
-    # Deliberately does NOT touch the endpoint's own Combustiveis/DataAtualizacao
     url = f"{MAP_URL}?id={sid}"
     payload = fetch_json(session, url)
-    if not payload.get("status"):
-        raise ValueError(payload.get("mensagem") or "DGEG returned status=false")
+    if not isinstance(payload, dict) or not payload.get("status"):
+        message = payload.get("mensagem") if isinstance(payload, dict) else None
+        raise ValueError(message or "DGEG returned invalid/status=false enrichment response")
     result = payload.get("resultado") or {}
+    if not isinstance(result, dict):
+        raise ValueError("DGEG returned malformed enrichment resultado")
 
     horario = result.get("HorarioPosto") or {}
     hours = {
@@ -137,6 +124,8 @@ def fetch_station_enrichment(session, sid):
 
 
 def _is_stale(cached_entry):
+    if not isinstance(cached_entry, dict):
+        return True
     fetched_at = cached_entry.get("fetchedAt")
     if not fetched_at:
         return True
@@ -144,27 +133,30 @@ def _is_stale(cached_entry):
         fetched = datetime.fromisoformat(fetched_at)
     except ValueError:
         return True
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) - fetched > timedelta(days=ENRICHMENT_MAX_AGE_DAYS)
 
 
+def _has_stale_enrichment(stations, enrichment_cache):
+    return any(_is_stale(enrichment_cache.get(sid)) for sid in stations)
+
+
 def enrich_stations(session, stations, enrichment_cache):
-    # Called once per unique station id (stations is already deduped), and
-    # only actually hits the network for stations that are new or whose
-    # cached copy has aged out -> see ENRICHMENT_MAX_AGE_DAYS.
     fetched = 0
     for i, (sid, station) in enumerate(stations.items(), 1):
         if i % 100 == 0:
             print(f"Enrichment: {i}/{len(stations)}")
-            
+
         cached = enrichment_cache.get(sid)
-        if cached is None or _is_stale(cached):
+        if _is_stale(cached):
             try:
                 enrichment = fetch_station_enrichment(session, sid)
                 enrichment["fetchedAt"] = datetime.now(timezone.utc).isoformat()
                 enrichment_cache[sid] = enrichment
                 fetched += 1
                 time.sleep(ENRICHMENT_REQUEST_DELAY_SECONDS)
-            except Exception as exc:  # noqa: BLE001 - one bad station shouldn't kill the run
+            except Exception as exc:  # noqa: BLE001 - one bad station must not kill the run
                 print(f"Portugal: enrichment failed for station {sid} ({exc}); using cached/defaults.")
                 enrichment = cached or {}
         else:
@@ -177,22 +169,79 @@ def enrich_stations(session, stations, enrichment_cache):
         station["observations"] = enrichment.get("observations")
 
     if fetched:
-        print(f"Portugal: fetched fresh enrichment for {fetched} station(s) "
-              f"(new or older than {ENRICHMENT_MAX_AGE_DAYS} days).")
-    return enrichment_cache
+        print(
+            f"Portugal: fetched fresh enrichment for {fetched} station(s) "
+            f"(new or older than {ENRICHMENT_MAX_AGE_DAYS} days)."
+        )
+    return fetched
+
+
+def _previous_station_count(manifest):
+    if not isinstance(manifest, dict):
+        return 0
+    count = manifest.get("stationCount")
+    if isinstance(count, int) and count >= 0:
+        return count
+    return sum(
+        entry.get("stationCount", 0)
+        for entry in (manifest.get("districts") or {}).values()
+        if isinstance(entry, dict)
+    )
+
+
+def _validate_retention(new_count, previous_count, label):
+    if new_count <= 0:
+        raise RuntimeError(f"Portugal: refusing to publish an empty {label} dataset.")
+    if previous_count <= 0:
+        return
+    ratio = new_count / previous_count
+    if ratio < MIN_RETAINED_STATION_RATIO:
+        raise RuntimeError(
+            "Portugal: refusing suspicious source contraction: "
+            f"{label} count {previous_count} -> {new_count} ({ratio:.1%}); "
+            f"minimum retained ratio is {MIN_RETAINED_STATION_RATIO:.0%}."
+        )
+
+
+def _previous_fuel_count(state, fuel_key):
+    if not isinstance(state, dict):
+        return 0
+    return sum(
+        1
+        for fuels in state.values()
+        if isinstance(fuels, dict) and fuel_key in fuels
+    )
+
+
+def _state_ids_changed(previous_state, next_state):
+    ids = set(previous_state) | set(next_state)
+    return {sid for sid in ids if previous_state.get(sid) != next_state.get(sid)}
 
 
 def run():
+    if not 0 < MIN_RETAINED_STATION_RATIO <= 1:
+        raise RuntimeError("Portugal: MIN_RETAINED_STATION_RATIO must be > 0 and <= 1.")
+
     session = make_session()
-    state = load_json(STATE_PATH, default={})  # {fuel_key: DataAtualizacao}
-    enrichment_cache = load_json(ENRICHMENT_STATE_PATH, default={})  # {sid: {...}}
-    override_state = load_json(OVERRIDES_STATE_PATH, default={})  # {"hash": ...}
+    state = load_json(STATE_PATH, default={}) or {}
+    enrichment_cache = load_json(ENRICHMENT_STATE_PATH, default={}) or {}
+    override_state = load_json(OVERRIDES_STATE_PATH, default={}) or {}
+    previous_manifest = load_json(MANIFEST_PATH, default={}) or {}
+    previous_count = _previous_station_count(previous_manifest)
 
     stations = {}
-    changed_ids = set()
+    next_state = {}
+    source_row_count = 0
 
     for fuel_id, fuel_key in FUEL_TYPES.items():
-        for row in fetch_fuel(session, fuel_id):
+        rows = fetch_fuel(session, fuel_id)
+        previous_fuel_count = _previous_fuel_count(state, fuel_key)
+        if previous_fuel_count > 0:
+            _validate_retention(len(rows), previous_fuel_count, f"{fuel_key} source row")
+        source_row_count += len(rows)
+        for row in rows:
+            if not isinstance(row, dict) or row.get("Id") in (None, ""):
+                continue
             sid = str(row["Id"])
             updated = row.get("DataAtualizacao")
 
@@ -211,8 +260,6 @@ def run():
                     "lng": row.get("Longitude"),
                     "fuels": {},
                     "lastUpdated": updated,
-                    # Country-specific field with no Spanish equivalent
-                    # kept out of the shared top-level schema on purpose.
                     "extra": {"stationType": row.get("TipoPosto")},
                 },
             )
@@ -223,26 +270,30 @@ def run():
             if updated and updated > (station["lastUpdated"] or ""):
                 station["lastUpdated"] = updated
 
-            prev_updated = state.get(sid, {}).get(fuel_key)
-            if updated != prev_updated:
-                changed_ids.add(sid)
-                state.setdefault(sid, {})[fuel_key] = updated
+            next_state.setdefault(sid, {})[fuel_key] = updated
 
-    overrides = load_json(OVERRIDES_PATH, default={})
+    changed_ids = _state_ids_changed(state, next_state)
+    source_state_changed = bool(changed_ids)
+    state = next_state
+
+    _validate_retention(len(stations), previous_count, "received station")
+
+    overrides = load_json(OVERRIDES_PATH, default={}) or {}
     overrides_hash = content_hash(overrides)
-    if not changed_ids and override_state.get("hash") == overrides_hash:
-        print("Portugal: no station updates found, skipping write.")
+    overrides_changed = override_state.get("hash") != overrides_hash
+    enrichment_stale = _has_stale_enrichment(stations, enrichment_cache)
+
+    if not source_state_changed and not overrides_changed and not enrichment_stale:
+        print("Portugal: no station, override, or enrichment updates found; skipping write.")
         return False
 
     if changed_ids:
         print(f"Portugal: {len(changed_ids)} station(s) changed.")
-    else:
-        print("Portugal: no station price updates; overrides changed, reprocessing.")
+    if overrides_changed:
+        print("Portugal: overrides changed, reprocessing.")
+    if enrichment_stale:
+        print("Portugal: enrichment TTL reached for at least one station; refreshing.")
 
-    # Enrichment pass -- once per unique station (see enrich_stations), not
-    # once per fuel type. On a cold start (empty cache) this enriches every
-    # station in `stations`, which can take a while; subsequent runs only
-    # touch new stations or ones whose cache has aged out.
     enrich_stations(session, stations, enrichment_cache)
 
     by_district = {}
@@ -268,18 +319,14 @@ def run():
         district = (station["district"] or "unknown").strip().lower().replace(" ", "_")
         by_district.setdefault(district, []).append(feature)
 
-    removed_districts = []
-    for path in glob.glob(os.path.join(DATA_DIR, "district_*.geojson")):
-        key = os.path.splitext(os.path.basename(path))[0]
-        if key not in by_district:
-            os.remove(path)
-            removed_districts.append(key)
+    published_count = sum(len(features) for features in by_district.values())
+    _validate_retention(published_count, previous_count, "published station")
 
     changed_files = 0
     district_entries = {}
     data_updated_through = None
     for district, features in by_district.items():
-        features.sort(key=lambda f: f["properties"]["id"])  # deterministic diffs
+        features.sort(key=lambda f: f["properties"]["id"])
         features = apply_overrides(features, OVERRIDES_PATH, country="PT")
         geojson = {"type": "FeatureCollection", "features": features}
         path = os.path.join(DATA_DIR, f"district_{district}.geojson")
@@ -296,30 +343,62 @@ def run():
             if updated and (data_updated_through is None or updated > data_updated_through):
                 data_updated_through = updated
 
-    manifest = {
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    manifest_core = {
+        "schemaVersion": 1,
+        "sourceStatus": "ok",
         "dataUpdatedThrough": data_updated_through,
-        "stationCount": len(stations),
+        "stationCount": published_count,
+        "receivedStationCount": len(stations),
+        "sourceRowCount": source_row_count,
+        "droppedStationCount": len(stats["dropped"]),
         "districts": district_entries,
     }
+    previous_core = {k: v for k, v in previous_manifest.items() if k != "generatedAt"}
+    if content_hash(previous_core) == content_hash(manifest_core):
+        generated_at = previous_manifest.get("generatedAt") or datetime.now(timezone.utc).isoformat()
+    else:
+        generated_at = datetime.now(timezone.utc).isoformat()
+    manifest = {"generatedAt": generated_at, **manifest_core}
+    manifest_changed = write_json_if_changed(MANIFEST_PATH, manifest)
 
-    write_json_if_changed(os.path.join(DATA_DIR, "manifest.json"), manifest)
-    write_json_if_changed(STATE_PATH, state)
-    write_json_if_changed(ENRICHMENT_STATE_PATH, enrichment_cache)
-    write_json_if_changed(OVERRIDES_STATE_PATH, {"hash": overrides_hash})
+    # Once the replacement manifest is valid/on disk, remove no-longer-referenced files.
+    removed_districts = []
+    for path in glob.glob(os.path.join(DATA_DIR, "district_*.geojson")):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        key = stem.removeprefix("district_")
+        if key not in by_district:
+            os.remove(path)
+            removed_districts.append(key)
+
+    state_changed = write_json_if_changed(STATE_PATH, state)
+    enrichment_changed = write_json_if_changed(ENRICHMENT_STATE_PATH, enrichment_cache)
+    override_state_changed = write_json_if_changed(OVERRIDES_STATE_PATH, {"hash": overrides_hash})
 
     print(f"Portugal: {changed_files}/{len(by_district)} district file(s) actually changed.")
     if removed_districts:
-        print(f"Portugal: removed {len(removed_districts)} stale district file(s): {', '.join(removed_districts)}.")
+        print(
+            f"Portugal: removed {len(removed_districts)} stale district file(s): "
+            f"{', '.join(removed_districts)}."
+        )
     if stats["rescued"]:
         print(f"Portugal: re-placed {len(stats['rescued'])} station(s) via override coordinates.")
     if stats["swapped"] or stats["dropped"]:
         print(f"Portugal: swapped {stats['swapped']} station(s).")
         print(f"Portugal: dropped {len(stats['dropped'])} station(s): {', '.join(stats['dropped'])}.")
         if stats["dropped"]:
-            print("Portugal: dropped stations need an override with \"coordinates\" [lng, lat] (or a source fix) to be re-published.")
+            print(
+                'Portugal: dropped stations need an override with "coordinates" [lng, lat] '
+                "(or a source fix) to be re-published."
+            )
 
-    return True
+    return bool(
+        changed_files
+        or removed_districts
+        or manifest_changed
+        or state_changed
+        or enrichment_changed
+        or override_state_changed
+    )
 
 
 if __name__ == "__main__":

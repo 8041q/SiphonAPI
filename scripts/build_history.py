@@ -1,18 +1,11 @@
-# Builds the daily price-history dataset and keeps data/history/index.json in
-# sync. Runs after both fetch scripts, before build_manifest.py.
-#
-# Output: one file per date under data/history/{YYYY}/{YYYY-MM-DD}.json,
-# plus data/history/index.json listing every day across all years with a
-# content hash apiece. A flat array of {id, brand, fuels} per station.
-#
-# No pruning is ever done here — old years are deleted by hand (remove the
-# folder) if desired. The root manifest embeds a hash of the index, so a
-# client only re-downloads files when the index actually changes.
+# Builds sparse price-history snapshots and keeps data/history/index.json in sync.
+# A new snapshot is written only when station/fuel content differs from the most
+# recent snapshot. The index itself is rebuilt from disk so manual deletion of an
+# old year is reflected automatically.
 
-import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import content_hash, load_json, write_json_if_changed  # noqa: E402
@@ -25,7 +18,7 @@ INDEX_PATH = os.path.join(HISTORY_DIR, "index.json")
 
 def stations_from_dir(data_dir):
     # Extract {id, brand, fuels} from every feature in every geojson file in
-    # the directory. Portugal falls back from brand to name
+    # the directory. Portugal falls back from brand to name.
     entries = []
     if not os.path.isdir(data_dir):
         return entries
@@ -37,14 +30,73 @@ def stations_from_dir(data_dir):
             continue
         for feature in geojson.get("features", []):
             props = feature.get("properties", {})
+            entry = {
+                "id": props.get("id"),
+                "brand": props.get("brand") or props.get("name"),
+                "fuels": props.get("fuels") or {},
+            }
+            if entry["id"]:
+                entries.append(entry)
+    return entries
+
+
+def _latest_snapshot_before(day):
+    latest_day = None
+    latest_path = None
+    if not os.path.isdir(HISTORY_DIR):
+        return None
+    for year in os.listdir(HISTORY_DIR):
+        if not year.isdigit():
+            continue
+        year_path = os.path.join(HISTORY_DIR, year)
+        if not os.path.isdir(year_path):
+            continue
+        for fname in os.listdir(year_path):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                snapshot_day = datetime.fromisoformat(fname[:-5]).date()
+            except ValueError:
+                continue
+            if snapshot_day >= day:
+                continue
+            if latest_day is None or snapshot_day > latest_day:
+                latest_day = snapshot_day
+                latest_path = os.path.join(year_path, fname)
+    return latest_path
+
+
+def _index_entries_from_disk():
+    entries = []
+    if not os.path.isdir(HISTORY_DIR):
+        return entries
+
+    for year in sorted(os.listdir(HISTORY_DIR)):
+        if not year.isdigit():
+            continue
+        year_path = os.path.join(HISTORY_DIR, year)
+        if not os.path.isdir(year_path):
+            continue
+        for fname in sorted(os.listdir(year_path)):
+            if not fname.endswith(".json"):
+                continue
+            date = fname[:-5]
+            try:
+                datetime.fromisoformat(date)
+            except ValueError:
+                continue
+            day_obj = load_json(os.path.join(year_path, fname))
+            if day_obj is None:
+                continue
             entries.append(
                 {
-                    "id": props.get("id"),
-                    "brand": props.get("brand") or props.get("name"),
-                    "fuels": props.get("fuels") or {},
+                    "date": date,
+                    "path": f"data/history/{year}/{fname}",
+                    "hash": content_hash(day_obj),
                 }
             )
-    return [e for e in entries if e.get("id")]
+    entries.sort(key=lambda item: item["date"])
+    return entries
 
 
 def run():
@@ -52,76 +104,40 @@ def run():
     year_dir = os.path.join(HISTORY_DIR, str(today.year))
     day_path = os.path.join(year_dir, today.isoformat() + ".json")
 
-    index = load_json(INDEX_PATH, default={"lastUpdated": None, "days": []})
-    known = {day["date"]: day for day in index.get("days", [])}
-
-    changed = False
-
-    # If it doesn't exist yet
-    if not os.path.exists(day_path):
-        stations = stations_from_dir(ES_DATA_DIR) + stations_from_dir(PT_DATA_DIR)
-        if stations:
-            stations.sort(key=lambda e: e["id"])
-
-            # Skip when the content is identical to the previous day's file
-            identical_to_previous = False
-            for offset in (1, 2, 3):
-                prev = today - timedelta(days=offset)
-                prev_path = os.path.join(
-                    HISTORY_DIR, str(prev.year), prev.isoformat() + ".json"
-                )
-                if os.path.exists(prev_path):
-                    identical_to_previous = (
-                        content_hash(stations)
-                        == content_hash(load_json(prev_path, default=[]))
-                    )
-                    break
-
-            if identical_to_previous:
-                print("History: prices unchanged since yesterday, skipping day file.")
-            else:
-                os.makedirs(year_dir, exist_ok=True)
-                with open(day_path, "w", encoding="utf-8") as f:
-                    json.dump(stations, f, ensure_ascii=False, separators=(",", ":"))
-                print(f"History: wrote {day_path} ({len(stations)} stations).")
-                changed = True
+    stations = stations_from_dir(ES_DATA_DIR) + stations_from_dir(PT_DATA_DIR)
+    if stations:
+        stations.sort(key=lambda e: e["id"])
+        if os.path.exists(day_path):
+            # A second workflow run on the same UTC day should refresh that day's
+            # snapshot if upstream prices changed after the first run.
+            if write_json_if_changed(day_path, stations):
+                print(f"History: refreshed {day_path} ({len(stations)} stations).")
         else:
-            print("History: no station data on disk, skipping today's file.")
+            previous_path = _latest_snapshot_before(today)
+            previous = load_json(previous_path, default=[]) if previous_path else None
+            if previous is not None and content_hash(stations) == content_hash(previous):
+                print("History: station prices unchanged since the latest snapshot; skipping day file.")
+            else:
+                write_json_if_changed(day_path, stations)
+                print(f"History: wrote {day_path} ({len(stations)} stations).")
+    else:
+        print("History: no station data on disk, skipping today's file.")
 
-    # Backfill any day files on disk missing from the index
-    if os.path.isdir(HISTORY_DIR):
-        for year in sorted(os.listdir(HISTORY_DIR)):
-            if not year.isdigit():
-                continue
-            year_path = os.path.join(HISTORY_DIR, year)
-            for fname in sorted(os.listdir(year_path)):
-                if not fname.endswith(".json"):
-                    continue
-                date = fname[:-5]
-                if date in known:
-                    continue
-                day_obj = load_json(os.path.join(year_path, fname))
-                if day_obj is None:
-                    continue
-                known[date] = {
-                    "date": date,
-                    "path": f"data/history/{year}/{fname}",
-                    "hash": content_hash(day_obj),
-                }
-                changed = True
+    # Rebuild from disk every run. This both adds new snapshots and removes
+    # stale index entries after an old year/folder is deleted manually.
+    days = _index_entries_from_disk()
+    existing = load_json(INDEX_PATH, default={"lastUpdated": None, "days": []}) or {}
+    if existing.get("days", []) == days:
+        print("History: index already matches disk.")
+        return False
 
-    if changed:
-        days = [known[date] for date in sorted(known)]
-        index = {
-            "lastUpdated": datetime.now(timezone.utc).isoformat(),
-            "days": days,
-        }
-        write_json_if_changed(INDEX_PATH, index)
-        print(f"History: index now covers {len(days)} day(s).")
-        return True
-
-    print("History: nothing to do.")
-    return False
+    index = {
+        "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        "days": days,
+    }
+    write_json_if_changed(INDEX_PATH, index)
+    print(f"History: index now covers {len(days)} snapshot day(s).")
+    return True
 
 
 if __name__ == "__main__":

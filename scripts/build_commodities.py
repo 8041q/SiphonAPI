@@ -1,19 +1,19 @@
 # Computes a retail/crude commodity dashboard and writes
 # data/commodities/dashboard.json.
 #
-# Reads the daily retail averages per country/fuel from data/history/{YYYY}/{YYYY-MM-DD}.json
-# (produced by build_history.py in the same workflow), then reads Brent + WTI crude closes from
-# data/commodities/crude.json (produced by fetch_crude.py). Aligns both date series by picking
-# the nearest preceding crude close for each trading day, then computes per-fuel, per-country
-# metrics: optimal lag days, Pearson correlation, and rocket-feather piecewise asymmetry.
+# History snapshots are intentionally sparse (unchanged retail days are omitted),
+# so all lag/window/trend calculations below use actual calendar dates rather
+# than treating adjacent observations as adjacent days.
 
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from bisect import bisect_right
+from datetime import date as dtdate
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
-from common import load_json, write_json_if_changed  # noqa: E402
+from common import content_hash, load_json, write_json_if_changed  # noqa: E402
 
 HISTORY_DIR = "data/history"
 CRUDE_PATH = "data/commodities/crude.json"
@@ -22,15 +22,16 @@ DASHBOARD_PATH = "data/commodities/dashboard.json"
 FUELS = ["gasoline95", "diesel"]
 COUNTRIES = ["es", "pt", "combined"]
 
-ROLLING_WINDOW = 90
-MAX_LAG = 14
+ROLLING_WINDOW_DAYS = 90
+MAX_LAG_DAYS = 14
+MAX_CRUDE_CARRY_DAYS = 7
+MIN_CORRELATION_SAMPLES = 10
 
-# ---------- helpers ----------
 
-def _avg(lst):
-    if not lst:
+def _avg(values):
+    if not values:
         return None
-    return sum(lst) / len(lst)
+    return sum(values) / len(values)
 
 
 def _pearson(xs, ys):
@@ -48,194 +49,231 @@ def _pearson(xs, ys):
     return num / den
 
 
-def _aligned(crude_points, retail_points):
-    """Return [(crude_date, crude_value, retail_date, retail_value), ...]"""
-    crude_map = {}  # date -> value
-    for p in crude_points:
-        crude_map[p["date"]] = p["value"]
-    crude_dates = sorted(crude_map.keys())
-
-    by_date = {p["date"]: p["value"] for p in retail_points}
-
-    matched = []
-    for rdate in sorted(by_date):
-        rval = by_date[rdate]
-        best = None
-        for cd in reversed(crude_dates):
-            if cd <= rdate:
-                best = cd
-                break
-        if best is None:
+def _dated_points(points):
+    parsed = []
+    for point in points:
+        try:
+            day = dtdate.fromisoformat(point["date"])
+            value = float(point["value"])
+        except (KeyError, TypeError, ValueError):
             continue
-        matched.append((best, crude_map[best], rdate, rval))
-    return matched
+        if math.isfinite(value):
+            parsed.append((day, value))
+    parsed.sort(key=lambda item: item[0])
+    return parsed
 
 
-def _lag_correlation(aligned, window_days):
-    if len(aligned) > window_days:
-        aligned = aligned[-window_days:]
+def _preceding_value(days, values, target):
+    """Return (day, value) for the latest observation <= target, if fresh enough."""
+    idx = bisect_right(days, target) - 1
+    if idx < 0:
+        return None
+    matched_day = days[idx]
+    if target - matched_day > timedelta(days=MAX_CRUDE_CARRY_DAYS):
+        return None
+    return matched_day, values[idx]
 
-    n = len(aligned)
-    if n < 10:
-        return 0, 0.0
 
-    crude_dates = [t[0] for t in aligned]
-    crude_vals = [t[1] for t in aligned]
-    retvals = [t[3] for t in aligned]
+def _aligned(crude_points, retail_points, lag_days=0, window_days=ROLLING_WINDOW_DAYS):
+    """Calendar-align crude to retail snapshots.
 
-    crude_index = {crude_dates[i]: i for i in range(n)}
+    For a retail snapshot on date R and lag L, use the latest crude close on or
+    before R-L calendar days. Weekend/holiday carry-forward is allowed for up to
+    MAX_CRUDE_CARRY_DAYS, but stale crude values are not silently reused forever.
+    Returns [(crude_date, crude_value, retail_date, retail_value), ...].
+    """
+    crude = _dated_points(crude_points)
+    retail = _dated_points(retail_points)
+    if not crude or not retail:
+        return []
 
+    latest_retail_day = retail[-1][0]
+    window_start = latest_retail_day - timedelta(days=window_days - 1)
+    retail = [(day, value) for day, value in retail if day >= window_start]
+
+    crude_days = [day for day, _ in crude]
+    crude_values = [value for _, value in crude]
+    lag = timedelta(days=lag_days)
+
+    aligned = []
+    for retail_day, retail_value in retail:
+        matched = _preceding_value(crude_days, crude_values, retail_day - lag)
+        if matched is None:
+            continue
+        crude_day, crude_value = matched
+        aligned.append((crude_day, crude_value, retail_day, retail_value))
+    return aligned
+
+
+def _aligned_changes(aligned):
+    """Return paired crude/retail changes between successive snapshots.
+
+    Correlating price *levels* can report a strong relationship merely because
+    both series trend over time. Using changes makes the metric describe whether
+    retail moves with crude instead of whether both happened to trend together.
+    """
+    crude_changes = []
+    retail_changes = []
+    for i in range(1, len(aligned)):
+        crude_delta = aligned[i][1] - aligned[i - 1][1]
+        retail_delta = aligned[i][3] - aligned[i - 1][3]
+        if math.isfinite(crude_delta) and math.isfinite(retail_delta):
+            crude_changes.append(crude_delta)
+            retail_changes.append(retail_delta)
+    return crude_changes, retail_changes
+
+
+def _lag_correlation(crude_points, retail_points, window_days):
     best_lag = 0
     best_r = -2.0
+    best_samples = 0
 
-    for lag in range(0, MAX_LAG + 1):
-        xs = []
-        ys = []
-        for idx in range(n):
-            remote = idx - lag
-            if remote < 0:
-                continue
-            xs.append(crude_vals[remote])
-            ys.append(retvals[idx])
-        if len(xs) < 3:
+    for lag in range(0, MAX_LAG_DAYS + 1):
+        aligned = _aligned(crude_points, retail_points, lag_days=lag, window_days=window_days)
+        xs, ys = _aligned_changes(aligned)
+        if len(xs) < MIN_CORRELATION_SAMPLES:
             continue
         r = _pearson(xs, ys)
         if r > best_r:
             best_r = r
             best_lag = lag
+            best_samples = len(xs)
 
     if best_r < -1.0:
-        return 0, 0.0
-    return best_lag, best_r
+        return 0, 0.0, 0
+    return best_lag, best_r, best_samples
 
 
-def _rocket_feather(aligned, window):
-    if len(aligned) > window:
-        aligned = aligned[-window:]
+def _rocket_feather(aligned):
     if len(aligned) < 3:
         return 0.0, 0.0, 1.0
 
     up_deltas = []
-    dn_deltas = []
-
+    down_deltas = []
     for i in range(1, len(aligned)):
-        crude_d = aligned[i][1] - aligned[i - 1][1]
-        retail_d = aligned[i][3] - aligned[i - 1][3]
-        if crude_d > 0:
-            up_deltas.append(retail_d)
-        elif crude_d < 0:
-            dn_deltas.append(retail_d)
+        crude_delta = aligned[i][1] - aligned[i - 1][1]
+        retail_delta = aligned[i][3] - aligned[i - 1][3]
+        if crude_delta > 0:
+            up_deltas.append(retail_delta)
+        elif crude_delta < 0:
+            down_deltas.append(retail_delta)
 
     up_avg = _avg(up_deltas) or 0.0
-    dn_avg = _avg(dn_deltas) or 0.0
-    asymmetry = dn_avg / up_avg if up_avg != 0 else 1.0
-    return up_avg, dn_avg, asymmetry
+    down_avg = _avg(down_deltas) or 0.0
+    asymmetry = down_avg / up_avg if up_avg != 0 else 1.0
+    return up_avg, down_avg, asymmetry
 
 
-def _trend(pts, days):
-    if len(pts) < days:
+def _trend(points, days):
+    parsed = _dated_points(points)
+    if len(parsed) < 2:
         return None
-    prev = pts[-days]["value"]
-    curr = pts[-1]["value"]
-    if prev == 0:
+
+    current_day, current_value = parsed[-1]
+    target = current_day - timedelta(days=days)
+    point_days = [day for day, _ in parsed]
+    point_values = [value for _, value in parsed]
+    matched = _preceding_value(point_days, point_values, target)
+    if matched is None:
         return None
-    return round(((curr - prev) / prev) * 100, 2)
+    _, previous_value = matched
+    if previous_value == 0:
+        return None
+    return round(((current_value - previous_value) / previous_value) * 100, 2)
 
 
-# ---------- main ----------
+def _load_retail_history():
+    retail = {f"{fuel}_{country}": [] for country in COUNTRIES for fuel in FUELS}
+    if not os.path.isdir(HISTORY_DIR):
+        return retail, False
+
+    for year in sorted(os.listdir(HISTORY_DIR)):
+        year_path = os.path.join(HISTORY_DIR, year)
+        if not os.path.isdir(year_path) or not year.isdigit():
+            continue
+        for fname in sorted(os.listdir(year_path)):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                dtdate.fromisoformat(fname[:-5])
+            except ValueError:
+                continue
+
+            day_stations = load_json(os.path.join(year_path, fname))
+            if not isinstance(day_stations, list):
+                continue
+
+            date = fname[:-5]
+            sums = {key: 0.0 for key in retail}
+            counts = {key: 0 for key in retail}
+
+            for station in day_stations:
+                sid = station.get("id", "")
+                if sid.startswith("es-"):
+                    country = "es"
+                elif sid.startswith("pt-"):
+                    country = "pt"
+                else:
+                    continue
+
+                fuels = station.get("fuels", {})
+                for fuel in FUELS:
+                    price = fuels.get(fuel)
+                    if isinstance(price, (int, float)) and price > 0 and math.isfinite(price):
+                        key = f"{fuel}_{country}"
+                        sums[key] += price
+                        counts[key] += 1
+
+            for fuel in FUELS:
+                es_key = f"{fuel}_es"
+                pt_key = f"{fuel}_pt"
+                combined_key = f"{fuel}_combined"
+                sums[combined_key] = sums[es_key] + sums[pt_key]
+                counts[combined_key] = counts[es_key] + counts[pt_key]
+
+            for key in retail:
+                if counts[key] > 0:
+                    retail[key].append(
+                        {"date": date, "value": round(sums[key] / counts[key], 3)}
+                    )
+
+    return retail, True
+
 
 def run():
-    # Fallback for existing, already outdated outputs
-    dashboard = load_json(DASHBOARD_PATH, default={}) or {}
-
-    # 1. Load crude
+    existing_dashboard = load_json(DASHBOARD_PATH, default={}) or {}
     crude_data = load_json(CRUDE_PATH, default={}) or {}
     crude_series = crude_data.get("series", {})
-    brent_pts = crude_series.get("brent", [])
-    wti_pts = crude_series.get("wti", [])
+    brent_points = crude_series.get("brent", [])
+    wti_points = crude_series.get("wti", [])
 
     status = "ok"
-    if not brent_pts and not wti_pts:
+    if not brent_points and not wti_points:
         print("build_commodities: no crude data available — dashboard will be empty.")
         status = "no_crude"
 
-    # 2. Gather retail averages from history day files
-    #    key = "<fuel>_<country>" -> [{date, value}]
-    retail = {}
-    for c in COUNTRIES:
-        for f in FUELS:
-            retail[f"{f}_{c}"] = []
-
-    if os.path.isdir(HISTORY_DIR):
-        for year in sorted(os.listdir(HISTORY_DIR)):
-            ypath = os.path.join(HISTORY_DIR, year)
-            if not os.path.isdir(ypath) or not year.isdigit():
-                continue
-            for fname in sorted(os.listdir(ypath)):
-                if not fname.endswith(".json"):
-                    continue
-
-                day_stations = load_json(os.path.join(ypath, fname))
-                if day_stations is None:
-                    continue
-
-                date = fname[:-5]
-
-                sums = {f"{f}_{c}": 0.0 for c in COUNTRIES for f in FUELS}
-                cnts = {f"{f}_{c}": 0 for c in COUNTRIES for f in FUELS}
-
-                for st in day_stations:
-                    sid = st.get("id", "")
-                    if sid.startswith("es-"):
-                        country = "es"
-                    elif sid.startswith("pt-"):
-                        country = "pt"
-                    else:
-                        continue
-
-                    fuels = st.get("fuels", {})
-                    for f in FUELS:
-                        price = fuels.get(f)
-                        if isinstance(price, (int, float)) and price > 0 and math.isfinite(price):
-                            key = f"{f}_{country}"
-                            sums[key] += price
-                            cnts[key] += 1
-
-                # combined = es + pt
-                for f in FUELS:
-                    es_key = f"{f}_es"
-                    pt_key = f"{f}_pt"
-                    comb_key = f"{f}_combined"
-                    sums[comb_key] = sums[es_key] + sums[pt_key]
-                    cnts[comb_key] = cnts[es_key] + cnts[pt_key]
-
-                for key in sums:
-                    if cnts[key] > 0:
-                        retail[key].append({"date": date, "value": round(sums[key] / cnts[key], 3)})
-
-            # end-for each file
-        # end-for each year
-    else:
+    retail, history_exists = _load_retail_history()
+    if not history_exists:
         print("build_commodities: history directory not found — skipping retail.")
         if status == "ok":
             status = "no_history"
 
-    # 3. Compute metrics for each fuel x country against crude
     metrics = {}
-    crude_for_analysis = brent_pts if brent_pts else wti_pts
+    crude_for_analysis = brent_points if brent_points else wti_points
 
-    for f in FUELS:
-        for c in COUNTRIES:
-            k = f"{f}_{c}"
-            points = retail.get(k, [])
+    for fuel in FUELS:
+        for country in COUNTRIES:
+            key = f"{fuel}_{country}"
+            points = retail.get(key, [])
 
             if not points or not crude_for_analysis:
-                metrics[k] = {
-                    "fuel": f,
-                    "country": c,
+                metrics[key] = {
+                    "fuel": fuel,
+                    "country": country,
                     "status": "insufficient_data",
                     "lagDays": 0,
                     "correlation": 0.0,
+                    "sampleCount": 0,
                     "rocket": 0.0,
                     "feather": 0.0,
                     "asymmetry": 1.0,
@@ -244,39 +282,60 @@ def run():
                 }
                 continue
 
-            adj = _aligned(crude_for_analysis, points)
-            lag, corr = _lag_correlation(adj, ROLLING_WINDOW)
-            rock, feat, asym = _rocket_feather(adj, ROLLING_WINDOW)
+            lag, correlation, sample_count = _lag_correlation(
+                crude_for_analysis, points, ROLLING_WINDOW_DAYS
+            )
+            zero_lag = _aligned(
+                crude_for_analysis, points, lag_days=0, window_days=ROLLING_WINDOW_DAYS
+            )
+            rocket, feather, asymmetry = _rocket_feather(zero_lag)
 
-            metrics[k] = {
-                "fuel": f,
-                "country": c,
-                "status": "ok" if len(adj) >= 3 else "insufficient_data",
+            metrics[key] = {
+                "fuel": fuel,
+                "country": country,
+                "status": "ok" if sample_count >= MIN_CORRELATION_SAMPLES else "insufficient_data",
                 "lagDays": lag,
-                "correlation": corr,
-                "rocket": rock,
-                "feather": feat,
-                "asymmetry": asym,
+                "correlation": correlation,
+                "sampleCount": sample_count,
+                "rocket": rocket,
+                "feather": feather,
+                "asymmetry": asymmetry,
                 "crudeTrend7d": _trend(crude_for_analysis, 7),
                 "crudeTrend30d": _trend(crude_for_analysis, 30),
             }
 
-    # 4. Build output
-    output = {
-        "lastUpdated": datetime.now(timezone.utc).isoformat(),
+    stable_output = {
+        "schemaVersion": 2,
         "status": status,
         "source": crude_data.get("source", "FRED"),
         "unit": crude_data.get("unit", "USD/barrel"),
+        "analysis": {
+            "rollingWindowDays": ROLLING_WINDOW_DAYS,
+            "maxLagDays": MAX_LAG_DAYS,
+            "lagUnit": "calendar_days",
+            "correlationBasis": "snapshot_price_changes",
+            "historySampling": "sparse_price_change_snapshots",
+        },
         "crude": {
-            "brent": brent_pts,
-            "wti": wti_pts,
+            "brent": brent_points,
+            "wti": wti_points,
         },
         "retail": retail,
         "metrics": metrics,
     }
 
+    existing_stable = {k: v for k, v in existing_dashboard.items() if k != "lastUpdated"}
+    if content_hash(existing_stable) == content_hash(stable_output):
+        print(f"build_commodities: unchanged, status={status}, metric_groups={len(metrics)}")
+        return False
+
+    output = {
+        "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        **stable_output,
+    }
     write_json_if_changed(DASHBOARD_PATH, output)
     print(f"build_commodities: status={status}, metric_groups={len(metrics)}")
+    return True
 
 
 if __name__ == "__main__":
