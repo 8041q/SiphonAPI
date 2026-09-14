@@ -37,6 +37,8 @@ jobs:
         run: python scripts/fetch_spain.py
         
       - name: Fetch Portugal
+        env:
+          MIN_RETAINED_FUEL_GASOLINE98PLUS_RATIO: "0.65"
         run: python scripts/fetch_portugal.py
 
       ## Build price history
