@@ -35,7 +35,21 @@ MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 ENRICHMENT_MAX_AGE_DAYS = 30
 ENRICHMENT_REQUEST_DELAY_SECONDS = 0.15
-MIN_RETAINED_STATION_RATIO = float(os.environ.get("MIN_RETAINED_STATION_RATIO", "0.75"))
+
+MIN_RETAINED_STATION_RATIO = float(
+    os.environ.get("MIN_RETAINED_STATION_RATIO", "0.75")
+)
+
+MIN_RETAINED_FUEL_RATIO = float(
+    os.environ.get(
+        "MIN_RETAINED_FUEL_RATIO",
+        str(MIN_RETAINED_STATION_RATIO),
+    )
+)
+def _fuel_retention_ratio(fuel_key):
+    # Allow a fuel-specific retention threshold without weakening the whole Portugal dataset retention check.
+    env_key = f"MIN_RETAINED_FUEL_{fuel_key.upper()}_RATIO"
+    return float(os.environ.get(env_key, str(MIN_RETAINED_FUEL_RATIO)))
 
 FUEL_TYPES = {
     3201: "gasoline95",
@@ -188,20 +202,28 @@ def _previous_station_count(manifest):
         if isinstance(entry, dict)
     )
 
-
-def _validate_retention(new_count, previous_count, label):
+def _validate_retention(
+    new_count,
+    previous_count,
+    label,
+    min_ratio=MIN_RETAINED_STATION_RATIO,
+):
     if new_count <= 0:
-        raise RuntimeError(f"Portugal: refusing to publish an empty {label} dataset.")
+        raise RuntimeError(
+            f"Portugal: refusing to publish an empty {label} dataset."
+        )
+
     if previous_count <= 0:
         return
+
     ratio = new_count / previous_count
-    if ratio < MIN_RETAINED_STATION_RATIO:
+
+    if ratio < min_ratio:
         raise RuntimeError(
             "Portugal: refusing suspicious source contraction: "
             f"{label} count {previous_count} -> {new_count} ({ratio:.1%}); "
-            f"minimum retained ratio is {MIN_RETAINED_STATION_RATIO:.0%}."
+            f"minimum retained ratio is {min_ratio:.0%}."
         )
-
 
 def _previous_fuel_count(state, fuel_key):
     if not isinstance(state, dict):
@@ -220,7 +242,22 @@ def _state_ids_changed(previous_state, next_state):
 
 def run():
     if not 0 < MIN_RETAINED_STATION_RATIO <= 1:
-        raise RuntimeError("Portugal: MIN_RETAINED_STATION_RATIO must be > 0 and <= 1.")
+        raise RuntimeError(
+            "Portugal: MIN_RETAINED_STATION_RATIO must be > 0 and <= 1."
+        )
+
+    if not 0 < MIN_RETAINED_FUEL_RATIO <= 1:
+        raise RuntimeError(
+            "Portugal: MIN_RETAINED_FUEL_RATIO must be > 0 and <= 1."
+        )
+
+    for fuel_key in FUEL_TYPES.values():
+        fuel_ratio = _fuel_retention_ratio(fuel_key)
+        if not 0 < fuel_ratio <= 1:
+            raise RuntimeError(
+                f"Portugal: retention ratio for {fuel_key} "
+                "must be > 0 and <= 1."
+            )
 
     session = make_session()
     state = load_json(STATE_PATH, default={}) or {}
@@ -236,8 +273,16 @@ def run():
     for fuel_id, fuel_key in FUEL_TYPES.items():
         rows = fetch_fuel(session, fuel_id)
         previous_fuel_count = _previous_fuel_count(state, fuel_key)
+        
         if previous_fuel_count > 0:
-            _validate_retention(len(rows), previous_fuel_count, f"{fuel_key} source row")
+            fuel_min_ratio = _fuel_retention_ratio(fuel_key)
+        
+            _validate_retention(
+                len(rows),
+                previous_fuel_count,
+                f"{fuel_key} source row",
+                fuel_min_ratio,
+            )
         source_row_count += len(rows)
         for row in rows:
             if not isinstance(row, dict) or row.get("Id") in (None, ""):
