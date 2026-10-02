@@ -30,6 +30,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Test data pipeline
+        run: python -m unittest discover -s tests
+
       - name: Fetch Spain
         env:
           SPAIN_SOURCE_URL: ${{ secrets.SPAIN_SOURCE_URL }}
@@ -49,7 +52,11 @@ jobs:
         run: python scripts/fetch_crude.py
 
       - name: Build commodity dashboard
-        run: python scripts/build_commodities.py
+        # Benchmarks refresh at most weekly and retain good data on source outages.
+        # Keep this before dashboard + root hashing so clients receive one payload.
+        run: |
+          python scripts/fetch_price_benchmarks.py
+          python scripts/build_commodities.py
 
       - name: Build root manifest
         run: python scripts/build_manifest.py

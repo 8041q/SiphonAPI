@@ -322,6 +322,8 @@ def run():
         },
         "retail": retail,
         "metrics": metrics,
+        # Shared cache payload: mobile needs no additional benchmark request.
+        "priceBenchmarks": load_json("data/commodities/price-benchmarks.json"),
     }
 
     existing_stable = {k: v for k, v in existing_dashboard.items() if k != "lastUpdated"}

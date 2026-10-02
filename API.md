@@ -114,3 +114,42 @@ requests:
 - The algorithm above is designed to need very few requests per check
   regardless - lean on the manifest hashes rather than re-fetching things "just in case."
 
+
+### Historical price-color references
+
+`data/commodities/dashboard.json` includes optional `priceBenchmarks` (schema 1).
+It is fetched and cached with the existing dashboard; no extra mobile request is
+required. Each `bands` entry is keyed by exact fuel and country, e.g. `diesel_pt`:
+
+```json
+{"fuel":"diesel","country":"PT","unit":"EUR/L","greenBelow":1.4429,"redAbove":1.745,"reference":1.5301,"referenceMonths":120,"inflationMonth":"2026-09"}
+```
+
+These illustrative boundaries are not constants: clients use the published
+values. Below `greenBelow` is green, above `redAbove` is red, and the inclusive
+interval between them is amber. Missing, malformed, unknown-method, incompatible
+unit or older-than-120-day references are neutral in the app. No premium fuel is
+aliased to regular fuel. Portugal LPG is not covered because its station price
+unit is kg rather than the Oil Bulletin's litres.
+
+Method `anchored_real_net_price_quartiles`: the fixed 2010–2019 tax-exclusive
+weekly series is converted to monthly medians in non-energy-inflation-adjusted
+terms. The lower/upper quartiles of those monthly medians are converted to pump
+prices with the latest applicable VAT, excise and other indirect taxes. At least
+96 reference months are required. Recent station averages, rankings and crude
+prices never change these bands. A broad price surge can therefore leave every
+station red. The reference period only changes through an explicit methodology
+revision, not a rolling window. This is a historical price-level comparison,
+not an affordability promise or a forecast.
+
+The API refreshes from the European Commission Weekly Oil Bulletin and Eurostat
+at most once every seven days. `state/price-benchmarks.json` holds the weekly
+cache; `data/commodities/price-benchmarks.json` holds the reference embedded in the
+dashboard. Source outages retain the last good reference and do not stop station
+publishing. Rechecking HTTP alone does not refresh `asOf`; that date follows the
+source observation. New calibration rejects source observations older than 30
+days and inflation older than 120 days.
+
+Validation: `python -m unittest discover -s tests`. The workflow runs these tests
+before fetching data. Historical checks are recorded in
+[price-benchmark-validation.md](docs/price-benchmark-validation.md).

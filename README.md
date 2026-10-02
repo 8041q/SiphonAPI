@@ -207,3 +207,16 @@ Nothing rejected ever reaches the published tiles.
 * **Spain**: Data provided by [MINETUR](https://sedeaplicaciones.minetur.gob.es) (Ministerio de Industria, Comercio y Turismo). Spanish public dataset used under open government data terms (attribution required).
 
 *This repository's source code is distributed under its own `LICENSE` file, which applies strictly to the code - not to the underlying government price datasets.*
+
+Price colors now use stable historical fuel/country references, calculated in
+`scripts/fetch_price_benchmarks.py` before the commodity dashboard. The fixed
+2010–2019 reference is adjusted for non-energy inflation and fuel taxes; a price
+surge cannot redefine itself as cheap. No new Python dependencies or mobile
+requests are needed. See [API.md](API.md) for the contract and
+[historical validation](docs/price-benchmark-validation.md) for checks.
+
+Run pipeline regression tests with `python -m unittest discover -s tests`.
+They exercise both station fetchers, history, crude, dashboard and root manifest
+in a temporary fixture directory, including an unchanged second run and
+benchmark-source failure recovery. The scheduled workflow runs them before
+publishing data.
